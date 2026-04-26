@@ -1,0 +1,10 @@
+bin/
+obj/
+client_dll.hpp
+offsets.hpp
+*.user
+*.suo
+*.pdb
+*.log
+.vs/
+.gemini/

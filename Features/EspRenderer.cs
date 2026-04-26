@@ -1,0 +1,185 @@
+using System.Windows;
+using System.Windows.Media;
+using FoxSense.Core;
+using FoxSense.Game;
+
+namespace FoxSense.Features;
+
+/// <summary>
+/// Draws ESP elements onto a WPF DrawingContext.
+/// </summary>
+public static class EspRenderer
+{
+    // ── Cached resources (allocated once) ──
+    private static readonly Typeface Font = new("Segoe UI");
+    private static readonly Pen OutlinePen = new(new SolidColorBrush(Color.FromArgb(180, 0, 0, 0)), 2.5);
+    private static readonly Pen BoneShadowPen = new(new SolidColorBrush(Color.FromArgb(120, 0, 0, 0)), 2.8);
+
+    static EspRenderer()
+    {
+        OutlinePen.Freeze();
+        BoneShadowPen.Freeze();
+    }
+
+    public static void Draw(DrawingContext dc, IReadOnlyList<PlayerData> players,
+        EspSettings settings, int screenW, int screenH, Vector3 localPos, int localTeam)
+    {
+        foreach (var p in players)
+        {
+            if (!p.OnScreen || p.BoxHeight < 5f) continue;
+            if (settings.EnemyOnly && p.Team == localTeam) continue;
+
+            var color = settings.Color;
+            var brush = new SolidColorBrush(color);
+            brush.Freeze();
+            var pen = new Pen(brush, 1.5);
+            pen.Freeze();
+
+            // ── Box ESP ──
+            if (settings.Box)
+                DrawBox(dc, p, pen);
+
+            // ── Skeleton ESP ──
+            if (settings.Skeleton)
+                DrawSkeleton(dc, p, color);
+
+            // ── Health Bar ──
+            if (settings.HealthBar)
+                DrawHealthBar(dc, p);
+
+            // ── Player Name ──
+            if (settings.Names && !string.IsNullOrEmpty(p.Name))
+                DrawName(dc, p, brush);
+
+            // ── Distance ──
+            if (settings.Distance)
+                DrawDistance(dc, p, localPos, brush);
+
+            // ── Snap Lines ──
+            if (settings.SnapLines)
+                DrawSnapLine(dc, p, pen, screenW, screenH);
+        }
+    }
+
+    public static void DrawFovCircle(DrawingContext dc, double fov,
+        int screenW, int screenH, Color color)
+    {
+        var pen = new Pen(new SolidColorBrush(Color.FromArgb(60, color.R, color.G, color.B)), 1.2);
+        pen.Freeze();
+        dc.DrawEllipse(null, pen,
+            new Point(screenW / 2.0, screenH / 2.0), fov, fov);
+    }
+
+    // ═══════════════════════════════════════════════════
+    //  DRAWING PRIMITIVES
+    // ═══════════════════════════════════════════════════
+
+    private static void DrawBox(DrawingContext dc, PlayerData p, Pen pen)
+    {
+        var rect = new Rect(p.BoxX, p.BoxY, p.BoxWidth, p.BoxHeight);
+
+        // Black outline
+        dc.DrawRectangle(null, OutlinePen,
+            new Rect(rect.X - 1, rect.Y - 1, rect.Width + 2, rect.Height + 2));
+        // Colored inner
+        dc.DrawRectangle(null, pen, rect);
+    }
+
+    private static void DrawSkeleton(DrawingContext dc, PlayerData p, Color color)
+    {
+        var bonePen = new Pen(new SolidColorBrush(color), 1.4);
+        bonePen.Freeze();
+
+        foreach (var (from, to) in Offsets.BoneConnections)
+        {
+            if (from >= PlayerData.MAX_BONES || to >= PlayerData.MAX_BONES) continue;
+            if (!p.BoneValid[from] || !p.BoneValid[to]) continue;
+
+            var p1 = new Point(p.BoneScreen[from].X, p.BoneScreen[from].Y);
+            var p2 = new Point(p.BoneScreen[to].X, p.BoneScreen[to].Y);
+
+            dc.DrawLine(BoneShadowPen, p1, p2);
+            dc.DrawLine(bonePen, p1, p2);
+        }
+    }
+
+    private static void DrawHealthBar(DrawingContext dc, PlayerData p)
+    {
+        float barW = 3f;
+        float barH = p.BoxHeight;
+        float barX = p.BoxX - barW - 3f;
+        float barY = p.BoxY;
+
+        // Background
+        dc.DrawRectangle(Brushes.Black, null,
+            new Rect(barX - 1, barY - 1, barW + 2, barH + 2));
+
+        // Health fill
+        float fillH = barH * (p.Health / 100f);
+        float fillY = barY + (barH - fillH);
+
+        byte r = (byte)(255 * (1f - p.Health / 100f));
+        byte g = (byte)(255 * (p.Health / 100f));
+        var hpBrush = new SolidColorBrush(Color.FromRgb(r, g, 0));
+        hpBrush.Freeze();
+
+        dc.DrawRectangle(hpBrush, null,
+            new Rect(barX, fillY, barW, fillH));
+    }
+
+    private static void DrawName(DrawingContext dc, PlayerData p, Brush brush)
+    {
+        try
+        {
+            var text = new FormattedText(p.Name, System.Globalization.CultureInfo.InvariantCulture,
+                FlowDirection.LeftToRight, Font, 10, brush, 1.0);
+
+            double x = p.ScreenHead.X - text.Width / 2;
+            double y = p.ScreenHead.Y - text.Height - 4;
+
+            // Shadow
+            var shadow = new FormattedText(p.Name, System.Globalization.CultureInfo.InvariantCulture,
+                FlowDirection.LeftToRight, Font, 10, Brushes.Black, 1.0);
+            dc.DrawText(shadow, new Point(x + 1, y + 1));
+            dc.DrawText(text, new Point(x, y));
+        }
+        catch { /* window transitioning */ }
+    }
+
+    private static void DrawDistance(DrawingContext dc, PlayerData p, Vector3 localPos, Brush brush)
+    {
+        try
+        {
+            float dist = localPos.DistanceTo(p.FeetPos) / 100f;
+            string label = $"{dist:F0}m";
+
+            var text = new FormattedText(label, System.Globalization.CultureInfo.InvariantCulture,
+                FlowDirection.LeftToRight, Font, 9, brush, 1.0);
+
+            dc.DrawText(text, new Point(
+                p.ScreenFeet.X - text.Width / 2,
+                p.ScreenFeet.Y + 4));
+        }
+        catch { /* window transitioning */ }
+    }
+
+    private static void DrawSnapLine(DrawingContext dc, PlayerData p, Pen pen, int screenW, int screenH)
+    {
+        dc.DrawLine(pen,
+            new Point(screenW / 2.0, screenH),
+            new Point(p.ScreenFeet.X, p.ScreenFeet.Y));
+    }
+}
+
+public class EspSettings
+{
+    public bool Enabled { get; set; } = true;
+    public bool Box { get; set; } = true;
+    public bool Skeleton { get; set; } = true;
+    public bool HealthBar { get; set; } = true;
+    public bool Names { get; set; } = true;
+    public bool Distance { get; set; } = true;
+    public bool SnapLines { get; set; }
+    public bool EnemyOnly { get; set; } = true;
+    public Color Color { get; set; } = Color.FromRgb(0xFF, 0x4B, 0x2B);
+}
