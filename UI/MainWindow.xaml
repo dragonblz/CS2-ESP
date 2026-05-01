@@ -199,10 +199,17 @@
 
                     <TextBlock Text="BONE TARGET" Margin="0,10,0,4" FontSize="10" Foreground="#555"/>
                     <ComboBox x:Name="comboBone" SelectedIndex="0" Height="30"
-                              Background="#2A2A3E" Foreground="White" BorderThickness="0">
-                        <ComboBoxItem Content="🧠 Head" Foreground="Black"/>
-                        <ComboBoxItem Content="🦴 Neck" Foreground="Black"/>
-                        <ComboBoxItem Content="💪 Chest" Foreground="Black"/>
+                              Background="#2A2A3E" Foreground="White" BorderThickness="0"
+                              FontFamily="Segoe UI" FontSize="12">
+                        <ComboBox.ItemContainerStyle>
+                            <Style TargetType="ComboBoxItem">
+                                <Setter Property="Foreground" Value="Black"/>
+                                <Setter Property="Background" Value="White"/>
+                            </Style>
+                        </ComboBox.ItemContainerStyle>
+                        <ComboBoxItem Content="🧠 Head"/>
+                        <ComboBoxItem Content="🦴 Neck"/>
+                        <ComboBoxItem Content="💪 Chest"/>
                     </ComboBox>
 
                     <TextBlock Text="AIM KEY" Margin="0,12,0,4" FontSize="10" Foreground="#555"/>
