@@ -19,7 +19,7 @@ public struct PlayerData
     public bool OnScreen;
 
     // Bones (screen space)
-    public const int MAX_BONES = 28;
+    public const int MAX_BONES = 30;
     public Vector3[] BoneScreen;
     public bool[] BoneValid;
 

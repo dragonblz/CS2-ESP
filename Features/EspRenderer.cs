@@ -6,19 +6,27 @@ using FoxSense.Game;
 namespace FoxSense.Features;
 
 /// <summary>
-/// Draws ESP elements onto a WPF DrawingContext.
+/// Production-quality ESP renderer using WPF DrawingContext.
+/// All pens/brushes are frozen for thread safety and performance.
 /// </summary>
 public static class EspRenderer
 {
-    // ── Cached resources (allocated once) ──
+    // ── Cached resources (allocated once, frozen) ──
     private static readonly Typeface Font = new("Segoe UI");
-    private static readonly Pen OutlinePen = new(new SolidColorBrush(Color.FromArgb(180, 0, 0, 0)), 2.5);
-    private static readonly Pen BoneShadowPen = new(new SolidColorBrush(Color.FromArgb(120, 0, 0, 0)), 2.8);
+    private static readonly Pen OutlinePen;
+    private static readonly Pen BoneShadowPen;
+    private static readonly Brush ShadowBrush;
 
     static EspRenderer()
     {
+        OutlinePen = new Pen(new SolidColorBrush(Color.FromArgb(160, 0, 0, 0)), 2.5);
         OutlinePen.Freeze();
+
+        BoneShadowPen = new Pen(new SolidColorBrush(Color.FromArgb(80, 0, 0, 0)), 3.2);
         BoneShadowPen.Freeze();
+
+        ShadowBrush = new SolidColorBrush(Color.FromArgb(180, 0, 0, 0));
+        ShadowBrush.Freeze();
     }
 
     public static void Draw(DrawingContext dc, IReadOnlyList<PlayerData> players,
@@ -35,27 +43,21 @@ public static class EspRenderer
             var pen = new Pen(brush, 1.5);
             pen.Freeze();
 
-            // ── Box ESP ──
             if (settings.Box)
                 DrawBox(dc, p, pen);
 
-            // ── Skeleton ESP ──
             if (settings.Skeleton)
                 DrawSkeleton(dc, p, color);
 
-            // ── Health Bar ──
             if (settings.HealthBar)
                 DrawHealthBar(dc, p);
 
-            // ── Player Name ──
             if (settings.Names && !string.IsNullOrEmpty(p.Name))
                 DrawName(dc, p, brush);
 
-            // ── Distance ──
             if (settings.Distance)
                 DrawDistance(dc, p, localPos, brush);
 
-            // ── Snap Lines ──
             if (settings.SnapLines)
                 DrawSnapLine(dc, p, pen, screenW, screenH);
         }
@@ -64,7 +66,7 @@ public static class EspRenderer
     public static void DrawFovCircle(DrawingContext dc, double fov,
         int screenW, int screenH, Color color)
     {
-        var pen = new Pen(new SolidColorBrush(Color.FromArgb(60, color.R, color.G, color.B)), 1.2);
+        var pen = new Pen(new SolidColorBrush(Color.FromArgb(50, color.R, color.G, color.B)), 1.2);
         pen.Freeze();
         dc.DrawEllipse(null, pen,
             new Point(screenW / 2.0, screenH / 2.0), fov, fov);
@@ -78,18 +80,23 @@ public static class EspRenderer
     {
         var rect = new Rect(p.BoxX, p.BoxY, p.BoxWidth, p.BoxHeight);
 
-        // Black outline
+        // Black outline for contrast
         dc.DrawRectangle(null, OutlinePen,
             new Rect(rect.X - 1, rect.Y - 1, rect.Width + 2, rect.Height + 2));
-        // Colored inner
         dc.DrawRectangle(null, pen, rect);
     }
 
+    /// <summary>
+    /// Draws anatomically correct bone connections.
+    /// Each connection is only drawn if BOTH endpoint bones are valid.
+    /// Shadow lines are drawn behind for contrast against bright backgrounds.
+    /// </summary>
     private static void DrawSkeleton(DrawingContext dc, PlayerData p, Color color)
     {
-        var bonePen = new Pen(new SolidColorBrush(color), 1.4);
+        var bonePen = new Pen(new SolidColorBrush(color), 1.6);
         bonePen.Freeze();
 
+        int validCount = 0;
         foreach (var (from, to) in Offsets.BoneConnections)
         {
             if (from >= PlayerData.MAX_BONES || to >= PlayerData.MAX_BONES) continue;
@@ -98,8 +105,24 @@ public static class EspRenderer
             var p1 = new Point(p.BoneScreen[from].X, p.BoneScreen[from].Y);
             var p2 = new Point(p.BoneScreen[to].X, p.BoneScreen[to].Y);
 
-            dc.DrawLine(BoneShadowPen, p1, p2);
-            dc.DrawLine(bonePen, p1, p2);
+            // Reject obviously broken lines (> 500px between bones on screen)
+            double lineLenSq = (p2.X - p1.X) * (p2.X - p1.X) + (p2.Y - p1.Y) * (p2.Y - p1.Y);
+            if (lineLenSq > 500 * 500) continue;
+
+            dc.DrawLine(BoneShadowPen, p1, p2); // Shadow
+            dc.DrawLine(bonePen, p1, p2);        // Colored line
+            validCount++;
+        }
+
+        // Draw head circle if we have a valid head bone and at least some skeleton lines
+        if (validCount > 0 && Offsets.BONE_HEAD < PlayerData.MAX_BONES && p.BoneValid[Offsets.BONE_HEAD])
+        {
+            var headPt = new Point(p.BoneScreen[Offsets.BONE_HEAD].X, p.BoneScreen[Offsets.BONE_HEAD].Y);
+            double radius = p.BoxHeight * 0.06; // Scale head circle with distance
+            if (radius > 2 && radius < 40)
+            {
+                dc.DrawEllipse(null, bonePen, headPt, radius, radius);
+            }
         }
     }
 
@@ -114,12 +137,13 @@ public static class EspRenderer
         dc.DrawRectangle(Brushes.Black, null,
             new Rect(barX - 1, barY - 1, barW + 2, barH + 2));
 
-        // Health fill
-        float fillH = barH * (p.Health / 100f);
+        // Health fill (green → red gradient)
+        float ratio = Math.Clamp(p.Health / 100f, 0f, 1f);
+        float fillH = barH * ratio;
         float fillY = barY + (barH - fillH);
 
-        byte r = (byte)(255 * (1f - p.Health / 100f));
-        byte g = (byte)(255 * (p.Health / 100f));
+        byte r = (byte)(255 * (1f - ratio));
+        byte g = (byte)(255 * ratio);
         var hpBrush = new SolidColorBrush(Color.FromRgb(r, g, 0));
         hpBrush.Freeze();
 
@@ -137,13 +161,12 @@ public static class EspRenderer
             double x = p.ScreenHead.X - text.Width / 2;
             double y = p.ScreenHead.Y - text.Height - 4;
 
-            // Shadow
             var shadow = new FormattedText(p.Name, System.Globalization.CultureInfo.InvariantCulture,
-                FlowDirection.LeftToRight, Font, 10, Brushes.Black, 1.0);
+                FlowDirection.LeftToRight, Font, 10, ShadowBrush, 1.0);
             dc.DrawText(shadow, new Point(x + 1, y + 1));
             dc.DrawText(text, new Point(x, y));
         }
-        catch { /* window transitioning */ }
+        catch { /* ignore rendering errors during transitions */ }
     }
 
     private static void DrawDistance(DrawingContext dc, PlayerData p, Vector3 localPos, Brush brush)
@@ -160,7 +183,7 @@ public static class EspRenderer
                 p.ScreenFeet.X - text.Width / 2,
                 p.ScreenFeet.Y + 4));
         }
-        catch { /* window transitioning */ }
+        catch { /* ignore rendering errors during transitions */ }
     }
 
     private static void DrawSnapLine(DrawingContext dc, PlayerData p, Pen pen, int screenW, int screenH)

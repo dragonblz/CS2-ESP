@@ -35,7 +35,7 @@ public sealed class SoftAim
         int boneId = settings.BoneTarget switch
         {
             BoneTarget.Neck => Offsets.BONE_NECK,
-            BoneTarget.Chest => Offsets.BONE_SPINE,
+            BoneTarget.Chest => Offsets.BONE_SPINE_4,
             _ => Offsets.BONE_HEAD,
         };
 

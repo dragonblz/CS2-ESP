@@ -3,8 +3,9 @@ namespace FoxSense.Game;
 using FoxSense.Core;
 
 /// <summary>
-/// Reads all game entities and caches them as a snapshot.
-/// NO team filtering here — features (ESP/aimbot) handle their own filtering.
+/// Reads all game entities and caches them as an atomic snapshot.
+/// Called from a dedicated high-priority thread.
+/// NO team filtering — features (ESP/aimbot) apply their own filters.
 /// </summary>
 public sealed class GameState
 {
@@ -31,11 +32,9 @@ public sealed class GameState
 
         try
         {
-            // Read view matrix
             var vm = _mem.Read<ViewMatrix>(_mem.ClientAddr(Offsets.dwViewMatrix));
             Matrix = vm;
 
-            // Read local player
             long localPawn = _mem.Read<long>(_mem.ClientAddr(Offsets.dwLocalPlayerPawn));
             LocalPawn = localPawn;
 
@@ -46,7 +45,6 @@ public sealed class GameState
             LocalTeam = localTeam;
             LocalPosition = _mem.Read<Vector3>(localPawn + Offsets.m_vOldOrigin);
 
-            // Read entity list
             long entityList = _mem.Read<long>(_mem.ClientAddr(Offsets.dwEntityList));
             long listEntry = EntityResolver.GetListEntry(_mem, entityList);
             if (listEntry == 0) return;
@@ -69,14 +67,12 @@ public sealed class GameState
 
                 int team = _mem.ReadByte(pawn + Offsets.m_iTeamNum);
                 if (team < 2 || team > 3) continue;
-                // NO team filtering — let ESP/aimbot decide
 
                 var feetPos = _mem.Read<Vector3>(pawn + Offsets.m_vOldOrigin);
                 if (feetPos.IsZero) continue;
 
                 var headPos = new Vector3(feetPos.X, feetPos.Y, feetPos.Z + Offsets.PLAYER_HEIGHT);
 
-                // Project to screen
                 bool feetOk = vm.WorldToScreen(feetPos, out var sf, screenW, screenH);
                 bool headOk = vm.WorldToScreen(headPos, out var sh, screenW, screenH);
                 bool onScreen = feetOk && headOk;
@@ -84,24 +80,34 @@ public sealed class GameState
                 // Read player name
                 string name = "";
                 try { name = _mem.ReadString(controller + Offsets.m_iszPlayerName, 32); }
-                catch { /* ignore */ }
+                catch { /* controller might be transitioning */ }
 
-                // Read bones
+                // ── Bone reading ──
+                var boneWorld  = new Vector3[PlayerData.MAX_BONES];
                 var boneScreen = new Vector3[PlayerData.MAX_BONES];
-                var boneValid = new bool[PlayerData.MAX_BONES];
+                var boneValid  = new bool[PlayerData.MAX_BONES];
 
                 long gsn = _mem.Read<long>(pawn + Offsets.m_pGameSceneNode);
                 if (gsn != 0)
                 {
-                    long boneArray = _mem.Read<long>(gsn + Offsets.m_modelState + 0x80);
-                    if (boneArray != 0)
+                    long boneArray = _mem.Read<long>(gsn + Offsets.m_modelState + Offsets.BONE_ARRAY_OFFSET);
+                    if (boneArray > 0x10000) // Sanity: must be a valid heap pointer
                     {
+                        // Read all bones used in connections
                         foreach (var (from, to) in Offsets.BoneConnections)
                         {
-                            ReadBone(vm, boneArray, from, boneScreen, boneValid,
-                                     screenW, screenH, feetPos);
-                            ReadBone(vm, boneArray, to, boneScreen, boneValid,
-                                     screenW, screenH, feetPos);
+                            TryReadBone(vm, boneArray, from, boneWorld, boneScreen, boneValid,
+                                        screenW, screenH, feetPos);
+                            TryReadBone(vm, boneArray, to, boneWorld, boneScreen, boneValid,
+                                        screenW, screenH, feetPos);
+                        }
+
+                        // If we got the head bone, use it for a more accurate headPos
+                        if (boneValid[Offsets.BONE_HEAD])
+                        {
+                            headPos = boneWorld[Offsets.BONE_HEAD];
+                            if (vm.WorldToScreen(headPos, out var headScr, screenW, screenH))
+                                sh = headScr;
                         }
                     }
                 }
@@ -130,20 +136,33 @@ public sealed class GameState
         }
     }
 
-    private void ReadBone(ViewMatrix vm, long boneArray, int boneId,
-        Vector3[] boneScreen, bool[] boneValid, int screenW, int screenH,
-        Vector3 feetPos)
+    /// <summary>
+    /// Reads a single bone position from the bone array.
+    /// Validates that the position is spatially close to the player (rejects garbage data).
+    /// Stores both world and screen positions.
+    /// </summary>
+    private void TryReadBone(ViewMatrix vm, long boneArray, int boneId,
+        Vector3[] boneWorld, Vector3[] boneScreen, bool[] boneValid,
+        int screenW, int screenH, Vector3 feetPos)
     {
-        if (boneId >= PlayerData.MAX_BONES || boneValid[boneId]) return;
+        if (boneId < 0 || boneId >= PlayerData.MAX_BONES) return;
+        if (boneValid[boneId]) return; // Already read
 
-        var world = _mem.Read<Vector3>(
-            boneArray + boneId * Offsets.BONE_STRIDE + Offsets.BONE_POS_OFFSET);
+        long addr = boneArray + boneId * Offsets.BONE_STRIDE;
+        var world = _mem.Read<Vector3>(addr);
 
-        // Validate: bone must be within 150 units of player feet
-        // This filters out garbled data from wrong bone array offsets
+        // Reject zero or NaN
         if (world.IsZero) return;
-        float dist = feetPos.DistanceTo(world);
-        if (dist > 150f) return;
+        if (float.IsNaN(world.X) || float.IsNaN(world.Y) || float.IsNaN(world.Z)) return;
+
+        // Spatial validation: bone must be within 120 units of player feet
+        float dx = world.X - feetPos.X;
+        float dy = world.Y - feetPos.Y;
+        float dz = world.Z - feetPos.Z;
+        float distSq = dx * dx + dy * dy + dz * dz;
+        if (distSq > 120f * 120f) return;
+
+        boneWorld[boneId] = world;
 
         if (vm.WorldToScreen(world, out var screen, screenW, screenH))
         {
