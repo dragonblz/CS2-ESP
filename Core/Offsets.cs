@@ -50,21 +50,21 @@ public static class Offsets
     public const int BONE_NECK       = 6;  // was 5
     public const int BONE_HEAD       = 7;  // was 6
 
-    public const int BONE_SHOULDER_L = 9;  // was 8
-    public const int BONE_ELBOW_L    = 10; // was 9
-    public const int BONE_HAND_L     = 11; // was 10
+    public const int BONE_SHOULDER_L = 8;
+    public const int BONE_ELBOW_L    = 9;
+    public const int BONE_HAND_L     = 10;
 
-    public const int BONE_SHOULDER_R = 14; // was 13
-    public const int BONE_ELBOW_R    = 15; // was 14
-    public const int BONE_HAND_R     = 16; // was 15
+    public const int BONE_SHOULDER_R = 13;
+    public const int BONE_ELBOW_R    = 14;
+    public const int BONE_HAND_R     = 15;
 
-    public const int BONE_HIP_L     = 23;  // was 22
-    public const int BONE_KNEE_L    = 24;  // was 23
-    public const int BONE_FOOT_L    = 25;  // was 24
+    public const int BONE_HIP_L     = 22;
+    public const int BONE_KNEE_L    = 23;
+    public const int BONE_FOOT_L    = 24;
 
-    public const int BONE_HIP_R     = 26;  // was 25
-    public const int BONE_KNEE_R    = 27;  // was 26
-    public const int BONE_FOOT_R    = 28;  // was 27
+    public const int BONE_HIP_R     = 25;
+    public const int BONE_KNEE_R    = 26;
+    public const int BONE_FOOT_R    = 27;
 
     /// <summary>
     /// Anatomically correct bone connections for skeleton ESP.

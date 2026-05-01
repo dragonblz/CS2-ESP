@@ -113,17 +113,6 @@ public static class EspRenderer
             dc.DrawLine(bonePen, p1, p2);        // Colored line
             validCount++;
         }
-
-        // Draw head circle if we have a valid head bone and at least some skeleton lines
-        if (validCount > 0 && Offsets.BONE_HEAD < PlayerData.MAX_BONES && p.BoneValid[Offsets.BONE_HEAD])
-        {
-            var headPt = new Point(p.BoneScreen[Offsets.BONE_HEAD].X, p.BoneScreen[Offsets.BONE_HEAD].Y);
-            double radius = p.BoxHeight * 0.06; // Scale head circle with distance
-            if (radius > 2 && radius < 40)
-            {
-                dc.DrawEllipse(null, bonePen, headPt, radius, radius);
-            }
-        }
     }
 
     private static void DrawHealthBar(DrawingContext dc, PlayerData p)
