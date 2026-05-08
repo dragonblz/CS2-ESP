@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
@@ -78,10 +79,11 @@ public partial class MainWindow : Window
     {
         while (_running)
         {
-            if (_mem.Attach())
+            if (!_mem.IsAttached)
             {
-                Dispatcher.Invoke(() => txtStatus.Text = "🟢 CS2 Connected");
-                return;
+                bool ok = _mem.Attach();
+                Dispatcher.Invoke(() =>
+                    txtStatus.Text = ok ? "🟡 CS2 found — waiting for match..." : "⏳ Waiting for CS2...");
             }
             await Task.Delay(1500);
         }
@@ -161,13 +163,17 @@ public partial class MainWindow : Window
             var players = _state.GetPlayers();
             EspRenderer.Draw(dc, players, _espSettings, screenW, screenH, _state.LocalPosition, _state.LocalTeam);
 
-            // FOV circle
             if (_aimSettings.Enabled && btnShowFov.IsChecked == true)
                 EspRenderer.DrawFovCircle(dc, _aimSettings.Fov, screenW, screenH, _espSettings.Color);
 
-            // Update status
             UpdateFps();
-            txtStatus.Text = $"🟢 Targets: {players.Count} | FPS: {_currentFps}";
+            int enemies = players.Count(p => p.Team != _state.LocalTeam);
+            Dispatcher.BeginInvoke(() =>
+                txtStatus.Text = $"🟢 Players: {players.Count} | Enemies: {enemies} | FPS: {_currentFps}");
+        }
+        else if (_mem.IsAttached && !_state.InGame)
+        {
+            Dispatcher.BeginInvoke(() => txtStatus.Text = "🟡 CS2 attached — not in game");
         }
     }
 
