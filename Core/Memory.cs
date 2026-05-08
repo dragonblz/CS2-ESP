@@ -6,11 +6,12 @@ using System.Text;
 namespace FoxSense.Core;
 
 /// <summary>
-/// Direct-syscall memory engine. Reads ntdll from disk to bypass hooks.
+/// Direct-syscall memory engine. Reads AND writes via ntdll syscalls
+/// parsed from the clean on-disk copy — bypasses all userland hooks.
 /// </summary>
 public sealed class Memory : IDisposable
 {
-    // ── kernel32 imports (never ntdll) ──
+    // ── kernel32 imports ──
     [DllImport("kernel32.dll")]
     private static extern IntPtr VirtualAlloc(IntPtr addr, uint size, uint type, uint protect);
 
@@ -23,27 +24,70 @@ public sealed class Memory : IDisposable
     [DllImport("kernel32.dll")]
     private static extern bool CloseHandle(IntPtr handle);
 
-    // ── Syscall delegate ──
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool WriteProcessMemory(
+        IntPtr hProcess, IntPtr lpBaseAddress,
+        byte[] lpBuffer, int nSize, out int lpNumberOfBytesWritten);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool ReadProcessMemory(
+        IntPtr hProcess, IntPtr lpBaseAddress,
+        byte[] lpBuffer, int nSize, out int lpNumberOfBytesRead);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr VirtualAllocEx(
+        IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool VirtualFreeEx(
+        IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint dwFreeType);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateRemoteThread(
+        IntPtr hProcess, IntPtr lpThreadAttributes, uint dwStackSize,
+        IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, out uint lpThreadId);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+    // ── Syscall delegates ──
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate int NtReadDelegate(
         IntPtr ProcessHandle, IntPtr BaseAddress,
         byte[] Buffer, int Size, out int BytesRead);
 
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int NtWriteDelegate(
+        IntPtr ProcessHandle, IntPtr BaseAddress,
+        byte[] Buffer, int Size, out int BytesWritten);
+
     private NtReadDelegate? _sysRead;
+    private NtWriteDelegate? _sysWrite;
     private IntPtr _stubMem = IntPtr.Zero;
 
-    // Minimum rights — read only
+    // Process access rights
+    private const int PROCESS_ALL_ACCESS = 0x1FFFFF;
     private const int PROCESS_VM_READ = 0x0010;
     private const int PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
     private const uint MEM_COMMIT = 0x1000;
     private const uint MEM_RESERVE = 0x2000;
     private const uint PAGE_EXECUTE_READWRITE = 0x40;
     private const uint MEM_RELEASE = 0x8000;
+    private const uint PAGE_READWRITE = 0x04;
+
+    // ── Stub layout: read stub (11 bytes) + write stub (11 bytes) ──
+    private const int STUB_SIZE = 11;
 
     public IntPtr Handle { get; private set; }
     public IntPtr ClientBase { get; private set; }
+    public IntPtr Engine2Base { get; private set; }
     public int Pid { get; private set; }
     public bool IsAttached { get; private set; }
+    public bool HasWriteAccess { get; private set; }
+
+    // Write jitter for stealth
+    private readonly Random _jitter = new();
+    private void SleepJitter() => Thread.Sleep(_jitter.Next(1, 4));
 
     // XOR-obfuscated strings
     private static string Decode(byte[] data)
@@ -55,6 +99,7 @@ public sealed class Memory : IDisposable
 
     private static readonly byte[] TargetProc = { 0x39, 0x29, 0x68 };                                     // "cs2"
     private static readonly byte[] TargetModule = { 0x39, 0x36, 0x33, 0x3F, 0x34, 0x2E, 0x74, 0x3E, 0x36, 0x36 }; // "client.dll"
+    private static readonly byte[] EngineModule = { 0x3F, 0x34, 0x3D, 0x33, 0x34, 0x3F, 0x68, 0x74, 0x3E, 0x36, 0x36 }; // "engine2.dll"
 
     // ═══════════════════════════════════════════════════
     //  SYSCALL INITIALIZATION
@@ -67,26 +112,44 @@ public sealed class Memory : IDisposable
             string sysDir = Environment.GetFolderPath(Environment.SpecialFolder.System);
             byte[] cleanNtdll = File.ReadAllBytes(Path.Combine(sysDir, "ntdll.dll"));
 
-            int sysNum = FindSyscallNumber(cleanNtdll, "NtReadVirtualMemory");
-            if (sysNum < 0) return false;
+            int readNum = FindSyscallNumber(cleanNtdll, "NtReadVirtualMemory");
+            int writeNum = FindSyscallNumber(cleanNtdll, "NtWriteVirtualMemory");
+            if (readNum < 0) return false;
 
-            byte[] stub =
-            {
-                0x4C, 0x8B, 0xD1,                                                // mov r10, rcx
-                0xB8, (byte)(sysNum & 0xFF), (byte)((sysNum >> 8) & 0xFF), 0x00, 0x00, // mov eax, sysNum
-                0x0F, 0x05,                                                        // syscall
-                0xC3                                                               // ret
-            };
-
-            _stubMem = VirtualAlloc(IntPtr.Zero, (uint)stub.Length,
+            // Allocate space for both stubs
+            int totalSize = STUB_SIZE * 2;
+            _stubMem = VirtualAlloc(IntPtr.Zero, (uint)totalSize,
                 MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
             if (_stubMem == IntPtr.Zero) return false;
 
-            Marshal.Copy(stub, 0, _stubMem, stub.Length);
+            // Build read stub
+            byte[] readStub = BuildStub(readNum);
+            Marshal.Copy(readStub, 0, _stubMem, readStub.Length);
             _sysRead = Marshal.GetDelegateForFunctionPointer<NtReadDelegate>(_stubMem);
+
+            // Build write stub (if syscall number found)
+            if (writeNum >= 0)
+            {
+                byte[] writeStub = BuildStub(writeNum);
+                IntPtr writePtr = _stubMem + STUB_SIZE;
+                Marshal.Copy(writeStub, 0, writePtr, writeStub.Length);
+                _sysWrite = Marshal.GetDelegateForFunctionPointer<NtWriteDelegate>(writePtr);
+            }
+
             return true;
         }
         catch { return false; }
+    }
+
+    private static byte[] BuildStub(int sysNum)
+    {
+        return new byte[]
+        {
+            0x4C, 0x8B, 0xD1,                                                       // mov r10, rcx
+            0xB8, (byte)(sysNum & 0xFF), (byte)((sysNum >> 8) & 0xFF), 0x00, 0x00,  // mov eax, sysNum
+            0x0F, 0x05,                                                               // syscall
+            0xC3                                                                      // ret
+        };
     }
 
     // ═══════════════════════════════════════════════════
@@ -161,7 +224,7 @@ public sealed class Memory : IDisposable
     }
 
     // ═══════════════════════════════════════════════════
-    //  ATTACH & READ
+    //  ATTACH & CONNECTION
     // ═══════════════════════════════════════════════════
 
     /// <summary>
@@ -191,8 +254,10 @@ public sealed class Memory : IDisposable
             Handle = IntPtr.Zero;
         }
         ClientBase = IntPtr.Zero;
+        Engine2Base = IntPtr.Zero;
         Pid = 0;
         IsAttached = false;
+        HasWriteAccess = false;
     }
 
     public bool Attach()
@@ -210,21 +275,36 @@ public sealed class Memory : IDisposable
         if (procs.Length == 0) return false;
 
         Pid = procs[0].Id;
-        Handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION, false, Pid);
-        if (Handle == IntPtr.Zero) return false;
 
-        string modName = Decode(TargetModule);
+        // Open with PROCESS_ALL_ACCESS (matching reference project)
+        Handle = OpenProcess(PROCESS_ALL_ACCESS, false, Pid);
+        if (Handle == IntPtr.Zero)
+        {
+            // Fallback: read-only if write access denied
+            Handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION, false, Pid);
+            if (Handle == IntPtr.Zero) return false;
+            HasWriteAccess = false;
+        }
+        else
+        {
+            // Write access available via syscall or kernel32 fallback
+            HasWriteAccess = true;
+        }
+
+        string clientName = Decode(TargetModule);
+        string engineName = Decode(EngineModule);
         ClientBase = IntPtr.Zero;
+        Engine2Base = IntPtr.Zero;
+
         try
         {
             foreach (ProcessModule mod in procs[0].Modules)
             {
-                if (mod.ModuleName != null &&
-                    mod.ModuleName.Equals(modName, StringComparison.OrdinalIgnoreCase))
-                {
+                if (mod.ModuleName == null) continue;
+                if (mod.ModuleName.Equals(clientName, StringComparison.OrdinalIgnoreCase))
                     ClientBase = mod.BaseAddress;
-                    break;
-                }
+                else if (mod.ModuleName.Equals(engineName, StringComparison.OrdinalIgnoreCase))
+                    Engine2Base = mod.BaseAddress;
             }
         }
         catch { /* Access denied on some modules — that's fine */ }
@@ -239,6 +319,10 @@ public sealed class Memory : IDisposable
         Handle = IntPtr.Zero;
         return false;
     }
+
+    // ═══════════════════════════════════════════════════
+    //  READ (via NtReadVirtualMemory syscall)
+    // ═══════════════════════════════════════════════════
 
     public T Read<T>(long address) where T : struct
     {
@@ -266,7 +350,204 @@ public sealed class Memory : IDisposable
         return Encoding.UTF8.GetString(buf, 0, end);
     }
 
+    // ═══════════════════════════════════════════════════
+    //  WRITE (via NtWriteVirtualMemory syscall)
+    // ═══════════════════════════════════════════════════
+
+    /// <summary>
+    /// Write a struct to game memory. Tries direct syscall first,
+    /// falls back to kernel32 WriteProcessMemory if syscall fails.
+    /// </summary>
+    public bool Write<T>(long address, T value) where T : struct
+    {
+        if (!HasWriteAccess) return false;
+        int size = Marshal.SizeOf<T>();
+        byte[] buf = new byte[size];
+        GCHandle pin = GCHandle.Alloc(buf, GCHandleType.Pinned);
+        try
+        {
+            Marshal.StructureToPtr(value, pin.AddrOfPinnedObject(), false);
+        }
+        finally { pin.Free(); }
+
+        // Try syscall first
+        if (_sysWrite != null)
+        {
+            int status = _sysWrite(Handle, (IntPtr)address, buf, size, out _);
+            if (status == 0) return true;
+        }
+
+        // Fallback to kernel32 WriteProcessMemory
+        return WriteProcessMemory(Handle, (IntPtr)address, buf, size, out _);
+    }
+
+    /// <summary>
+    /// Write raw bytes to game memory.
+    /// </summary>
+    public bool WriteBytes(long address, byte[] data)
+    {
+        if (!HasWriteAccess) return false;
+        if (_sysWrite != null)
+        {
+            int status = _sysWrite(Handle, (IntPtr)address, data, data.Length, out _);
+            if (status == 0) return true;
+        }
+        return WriteProcessMemory(Handle, (IntPtr)address, data, data.Length, out _);
+    }
+
+    /// <summary>
+    /// Write with randomized jitter delay for stealth.
+    /// Use this for skin changer writes to defeat behavioral analysis.
+    /// </summary>
+    public bool WriteJittered<T>(long address, T value) where T : struct
+    {
+        SleepJitter();
+        return Write(address, value);
+    }
+
+    // ═══════════════════════════════════════════════════
+    //  FORCE FULL UPDATE (instant skin refresh)
+    // ═══════════════════════════════════════════════════
+
+    /// <summary>
+    /// Forces CS2 to request a full entity snapshot from the server
+    /// by setting deltaTick = -1 on the NetworkGameClient.
+    /// This refreshes all weapon entities, applying skin changes instantly.
+    /// Much safer than CreateRemoteThread — just a single 4-byte write.
+    /// </summary>
+    public bool ForceFullUpdate()
+    {
+        if (Engine2Base == IntPtr.Zero || !HasWriteAccess) return false;
+        long netClient = Read<long>(Engine2Base.ToInt64() + SkinOffsets.dwNetworkGameClient);
+        if (netClient == 0 || netClient < 0x10000) return false;
+        return Write(netClient + SkinOffsets.dwNetworkGameClient_deltaTick, -1);
+    }
+
+    // ═══════════════════════════════════════════════════
+    //  HELPERS
+    // ═══════════════════════════════════════════════════
+
     public long ClientAddr(int offset) => ClientBase.ToInt64() + offset;
+    public long EngineAddr(int offset) => Engine2Base.ToInt64() + offset;
+
+    // ═══════════════════════════════════════════════════
+    //  REMOTE MEMORY ALLOCATION (in game process)
+    // ═══════════════════════════════════════════════════
+
+    /// <summary>
+    /// Allocate memory in the target process (matching reference's mem.Allocate).
+    /// </summary>
+    public long AllocateRemote(uint size = 0x1000)
+    {
+        IntPtr addr = VirtualAllocEx(Handle, IntPtr.Zero, size,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        return addr.ToInt64();
+    }
+
+    /// <summary>
+    /// Free remote memory (matching reference's mem.Free).
+    /// </summary>
+    public bool FreeRemote(long address)
+    {
+        return VirtualFreeEx(Handle, (IntPtr)address, 0, MEM_RELEASE);
+    }
+
+    // ═══════════════════════════════════════════════════
+    //  REMOTE THREAD EXECUTION
+    // ═══════════════════════════════════════════════════
+
+    /// <summary>
+    /// Call a function in the target process via CreateRemoteThread.
+    /// Matching reference's mem.CallThread(funcAddress).
+    /// </summary>
+    public bool CallThread(long funcAddress)
+    {
+        if (funcAddress == 0) return false;
+        IntPtr hThread = CreateRemoteThread(Handle, IntPtr.Zero, 0,
+            (IntPtr)funcAddress, IntPtr.Zero, 0, out _);
+        if (hThread == IntPtr.Zero) return false;
+        WaitForSingleObject(hThread, 5000);
+        CloseHandle(hThread);
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════
+    //  SIGNATURE SCANNING
+    // ═══════════════════════════════════════════════════
+
+    /// <summary>
+    /// Read raw bytes from game memory.
+    /// </summary>
+    public byte[] ReadBytes(long address, int size)
+    {
+        byte[] buf = new byte[size];
+        _sysRead?.Invoke(Handle, (IntPtr)address, buf, size, out _);
+        return buf;
+    }
+
+    /// <summary>
+    /// Scan a module for a byte pattern (matching reference's mem.SigScan).
+    /// Pattern format: "48 83 EC ?? E8 ?? ?? ?? ??" where ?? is wildcard.
+    /// </summary>
+    public long SigScan(IntPtr moduleBase, int moduleSize, string pattern)
+    {
+        if (moduleBase == IntPtr.Zero || moduleSize <= 0) return 0;
+
+        // Parse pattern
+        var parts = pattern.Split(' ');
+        var bytes = new (byte val, bool wild)[parts.Length];
+        for (int i = 0; i < parts.Length; i++)
+        {
+            if (parts[i] == "?" || parts[i] == "??")
+                bytes[i] = (0, true);
+            else
+                bytes[i] = (Convert.ToByte(parts[i], 16), false);
+        }
+
+        // Read module in chunks to avoid huge allocations
+        int chunkSize = 0x100000; // 1MB chunks
+        long baseAddr = moduleBase.ToInt64();
+
+        for (int offset = 0; offset < moduleSize - bytes.Length; offset += chunkSize - bytes.Length)
+        {
+            int readSize = Math.Min(chunkSize, moduleSize - offset);
+            byte[] buffer = ReadBytes(baseAddr + offset, readSize);
+
+            for (int i = 0; i < readSize - bytes.Length; i++)
+            {
+                bool found = true;
+                for (int j = 0; j < bytes.Length; j++)
+                {
+                    if (!bytes[j].wild && buffer[i + j] != bytes[j].val)
+                    {
+                        found = false;
+                        break;
+                    }
+                }
+                if (found) return baseAddr + offset + i;
+            }
+        }
+        return 0;
+    }
+
+    /// <summary>
+    /// Get module size for sig scanning.
+    /// </summary>
+    public int GetModuleSize(string moduleName)
+    {
+        try
+        {
+            var procs = Process.GetProcessById(Pid);
+            foreach (ProcessModule mod in procs.Modules)
+            {
+                if (mod.ModuleName != null &&
+                    mod.ModuleName.Equals(moduleName, StringComparison.OrdinalIgnoreCase))
+                    return mod.ModuleMemorySize;
+            }
+        }
+        catch { }
+        return 0;
+    }
 
     public void Dispose()
     {
@@ -281,5 +562,7 @@ public sealed class Memory : IDisposable
             Handle = IntPtr.Zero;
         }
         IsAttached = false;
+        HasWriteAccess = false;
     }
+
 }

@@ -1,10 +1,23 @@
+# Build outputs
 bin/
 obj/
-client_dll.hpp
-offsets.hpp
+
+# IDE
+.vs/
 *.user
 *.suo
-*.pdb
+*.cache
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Dumps
+*.hpp
+*.dmp
+
+# Logs
 *.log
-.vs/
-.gemini/
+
+# Skin cache
+skins_cache.json

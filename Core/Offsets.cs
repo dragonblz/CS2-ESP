@@ -8,11 +8,12 @@ namespace FoxSense.Core;
 public static class Offsets
 {
     // ── Base offsets (relative to client.dll, Build 14160 — 2026-05-08) ──
-    public const int dwEntityList            = 0x24D0DC0;
-    public const int dwLocalPlayerController = 0x230A4F0;
-    public const int dwViewMatrix            = 0x2330AE0;
-    public const int dwLocalPlayerPawn       = 0x2056700;
-    public const int dwViewAngles            = 0x2340288;
+    // These are static (not const) so OffsetUpdater can overwrite them at startup.
+    public static int dwEntityList            = 0x24D0DC0;
+    public static int dwLocalPlayerController = 0x230A4F0;
+    public static int dwViewMatrix            = 0x2330AE0;
+    public static int dwLocalPlayerPawn       = 0x2056700;
+    public static int dwViewAngles            = 0x2340288;
 
     // ── Controller (CCSPlayerController) ──
     public const int m_hPawn          = 0x6BC;   // CHandle<C_BasePlayerPawn>
@@ -20,10 +21,10 @@ public static class Offsets
     public const int m_iszPlayerName  = 0x6F0;   // char[128]
 
     // ── Pawn (C_CSPlayerPawn) ──
-    public const int m_iHealth         = 0x34C;  // int32
-    public const int m_iTeamNum        = 0x3EB;  // uint8
-    public const int m_vOldOrigin      = 0x1390; // Vector
-    public const int m_pGameSceneNode  = 0x330;  // CGameSceneNode*
+    public static int m_iHealth         = 0x34C;  // int32
+    public static int m_iTeamNum        = 0x3EB;  // uint8
+    public static int m_vOldOrigin      = 0x1390; // Vector
+    public static int m_pGameSceneNode  = 0x330;  // CGameSceneNode*
     public const int m_ArmorValue      = 0x1C7C; // int32
 
     // ── Scene node / skeleton ──

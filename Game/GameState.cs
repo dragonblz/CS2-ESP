@@ -16,6 +16,7 @@ public sealed class GameState
     public ViewMatrix Matrix { get; private set; }
     public int LocalTeam { get; private set; }
     public long LocalPawn { get; private set; }
+    public long LocalController { get; private set; }
     public Vector3 LocalPosition { get; private set; }
     public bool InGame { get; private set; }
 
@@ -37,6 +38,9 @@ public sealed class GameState
 
             long localPawn = _mem.Read<long>(_mem.ClientAddr(Offsets.dwLocalPlayerPawn));
             LocalPawn = localPawn;
+
+            long localCtrl = _mem.Read<long>(_mem.ClientAddr(Offsets.dwLocalPlayerController));
+            LocalController = localCtrl;
 
             if (localPawn == 0) { InGame = false; return; }
             InGame = true;
@@ -155,12 +159,13 @@ public sealed class GameState
         if (world.IsZero) return;
         if (float.IsNaN(world.X) || float.IsNaN(world.Y) || float.IsNaN(world.Z)) return;
 
-        // Spatial validation: bone must be within 120 units of player feet
+        // Spatial validation: bone must be within 200 units of player feet
+        // (T-side models have slightly different bone origins — need wider tolerance)
         float dx = world.X - feetPos.X;
         float dy = world.Y - feetPos.Y;
         float dz = world.Z - feetPos.Z;
         float distSq = dx * dx + dy * dy + dz * dz;
-        if (distSq > 120f * 120f) return;
+        if (distSq > 200f * 200f) return;
 
         boneWorld[boneId] = world;
 

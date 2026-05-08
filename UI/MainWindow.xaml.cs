@@ -24,6 +24,8 @@ public partial class MainWindow : Window
     private readonly SoftAim _softAim = new();
     private readonly EspSettings _espSettings = new();
     private readonly AimSettings _aimSettings = new();
+    private readonly SkinChanger _skinChanger = new();
+    private readonly SkinDatabase _skinDb = new();
 
     private OverlayWindow? _overlay;
     private Thread? _gameThread;
@@ -61,6 +63,48 @@ public partial class MainWindow : Window
         StartRenderLoop();
         StartGuiToggleLoop();
         ConnectToGame();
+        InitSkinTab();
+        DarkenAllComboBoxes();
+    }
+
+    /// <summary>
+    /// Force all ComboBox popups to have dark backgrounds.
+    /// WPF's default ComboBox template uses SystemDropShadowChrome with a white border
+    /// that cannot be styled via implicit styles alone.
+    /// </summary>
+    private void DarkenAllComboBoxes()
+    {
+        foreach (var cb in FindVisualChildren<ComboBox>(this))
+        {
+            cb.DropDownOpened += (s, _) =>
+            {
+                if (s is ComboBox combo)
+                {
+                    var popup = combo.Template?.FindName("PART_Popup", combo) as Popup;
+                    if (popup?.Child is FrameworkElement fe)
+                    {
+                        // Try to find the border inside the popup
+                        foreach (var border in FindVisualChildren<System.Windows.Controls.Border>(fe))
+                        {
+                            border.Background = new SolidColorBrush(Color.FromRgb(0x2A, 0x2A, 0x3E));
+                            border.BorderBrush = new SolidColorBrush(Color.FromRgb(0x3A, 0x3A, 0x50));
+                        }
+                    }
+                }
+            };
+        }
+    }
+
+    private static IEnumerable<T> FindVisualChildren<T>(DependencyObject parent) where T : DependencyObject
+    {
+        if (parent == null) yield break;
+        for (int i = 0; i < VisualTreeHelper.GetChildrenCount(parent); i++)
+        {
+            var child = VisualTreeHelper.GetChild(parent, i);
+            if (child is T t) yield return t;
+            foreach (var grandchild in FindVisualChildren<T>(child))
+                yield return grandchild;
+        }
     }
 
     private void SetupSliders()
@@ -110,6 +154,10 @@ public partial class MainWindow : Window
             if (!_mem.IsAttached) continue;
 
             _state.Update(screenW, screenH);
+
+            // Skin changer tick (only writes when needed)
+            try { _skinChanger.Tick(_mem, _state); }
+            catch { /* Swallow write errors during transitions */ }
         }
     }
 
@@ -225,18 +273,16 @@ public partial class MainWindow : Window
         _activeTab = tab;
         panelVisuals.Visibility = tab == "visuals" ? Visibility.Visible : Visibility.Collapsed;
         panelAimbot.Visibility = tab == "aimbot" ? Visibility.Visible : Visibility.Collapsed;
+        panelSkins.Visibility = tab == "skins" ? Visibility.Visible : Visibility.Collapsed;
         panelSettings.Visibility = tab == "settings" ? Visibility.Visible : Visibility.Collapsed;
 
-        var accent = new LinearGradientBrush(
-            Color.FromRgb(0xFF, 0x4B, 0x2B), Color.FromRgb(0xFF, 0x41, 0x6C), 0);
-        var dim = new SolidColorBrush(Color.FromRgb(0x1E, 0x1E, 0x32));
+        var white = Brushes.White;
+        var gray = new SolidColorBrush(Color.FromRgb(0x77, 0x77, 0x77));
 
-        btnTabVisuals.Background = tab == "visuals" ? accent : dim;
-        btnTabVisuals.Foreground = tab == "visuals" ? Brushes.White : new SolidColorBrush(Color.FromRgb(0x88, 0x88, 0x88));
-        btnTabAimbot.Background = tab == "aimbot" ? accent : dim;
-        btnTabAimbot.Foreground = tab == "aimbot" ? Brushes.White : new SolidColorBrush(Color.FromRgb(0x88, 0x88, 0x88));
-        btnTabSettings.Background = tab == "settings" ? accent : dim;
-        btnTabSettings.Foreground = tab == "settings" ? Brushes.White : new SolidColorBrush(Color.FromRgb(0x88, 0x88, 0x88));
+        btnNavEsp.Foreground = tab == "visuals" ? white : gray;
+        btnNavAimbot.Foreground = tab == "aimbot" ? white : gray;
+        btnNavSkins.Foreground = tab == "skins" ? white : gray;
+        btnNavSettings.Foreground = tab == "settings" ? white : gray;
     }
 
     private void BtnTab_Click(object sender, RoutedEventArgs e)
@@ -281,6 +327,70 @@ public partial class MainWindow : Window
     private void BtnAim_Unchecked(object sender, RoutedEventArgs e) => btnAimToggle.Content = "Aimbot: OFF";
     private void BtnEnemyOnly_Checked(object sender, RoutedEventArgs e) => btnEnemyOnly.Content = "Enemies Only";
     private void BtnEnemyOnly_Unchecked(object sender, RoutedEventArgs e) => btnEnemyOnly.Content = "All Players";
+    private void BtnSkin_Checked(object sender, RoutedEventArgs e) { btnSkinToggle.Content = "Skin Changer: ON"; _skinChanger.Enabled = true; }
+    private void BtnSkin_Unchecked(object sender, RoutedEventArgs e) { btnSkinToggle.Content = "Skin Changer: OFF"; _skinChanger.Enabled = false; }
+
+    // ═══════════════════════════════════════════════════
+    //  SKIN TAB LOGIC
+    // ═══════════════════════════════════════════════════
+
+    private List<SkinDatabase.SkinInfo> _currentWeaponSkins = new();
+
+    private async void InitSkinTab()
+    {
+        // Auto-update offsets first
+        try { await OffsetUpdater.UpdateAsync(); }
+        catch { /* Non-critical */ }
+
+        // Load skin database
+        await _skinDb.LoadAsync();
+
+        if (!_skinDb.IsLoaded) return;
+
+        Dispatcher.Invoke(() =>
+        {
+            // Populate weapon dropdown
+            comboWeapon.Items.Clear();
+            comboWeapon.Items.Add(new ComboBoxItem { Content = "-- Select Weapon --" });
+            foreach (string name in _skinDb.GetAvailableWeapons())
+                comboWeapon.Items.Add(new ComboBoxItem { Content = name });
+            comboWeapon.SelectedIndex = 0;
+        });
+    }
+
+    private void ComboWeapon_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (comboWeapon.SelectedIndex <= 0) { listSkins.ItemsSource = null; return; }
+        var item = comboWeapon.SelectedItem as ComboBoxItem;
+        string weaponName = item?.Content?.ToString() ?? "";
+        if (!SkinDatabase.WeaponNameToDefIndex.TryGetValue(weaponName, out ushort defIdx)) return;
+
+        _currentWeaponSkins = _skinDb.GetSkinsForWeapon(defIdx);
+        listSkins.ItemsSource = _currentWeaponSkins.Select(s => new SkinDisplayItem
+        {
+            Name = s.Name,
+            ImageUrl = s.ImageUrl,
+            Rarity = s.Rarity,
+            Skin = s
+        }).ToList();
+    }
+
+    private void ListSkins_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (listSkins.SelectedItem is not SkinDisplayItem display) return;
+        var skin = display.Skin;
+        _skinChanger.SetWeaponSkin(skin.WeaponDefIndex, skin);
+    }
+
+    private void ComboKnife_Changed(object sender, SelectionChangedEventArgs e) { }
+    private void ComboKnifeSkin_Changed(object sender, SelectionChangedEventArgs e) { }
+    private void ComboGloveType_Changed(object sender, SelectionChangedEventArgs e) { }
+    private void ComboGloveSkin_Changed(object sender, SelectionChangedEventArgs e) { }
+
+    private void BtnForceRefresh_Click(object sender, RoutedEventArgs e)
+    {
+        _skinChanger.ForceUpdate = true;
+    }
 
     private void BtnKeyBind_Click(object sender, RoutedEventArgs e)
     {
@@ -352,4 +462,38 @@ public partial class MainWindow : Window
         _mem.Dispose();
         base.OnClosing(e);
     }
+}
+
+/// <summary>
+/// Display model for the skin preview list.
+/// WPF binds to these properties for image + name + rarity.
+/// </summary>
+public class SkinDisplayItem
+{
+    public string Name { get; set; } = "";
+    public string ImageUrl { get; set; } = "";
+    public int Rarity { get; set; }
+    public SkinDatabase.SkinInfo Skin { get; set; } = null!;
+
+    public string RarityText => Rarity switch
+    {
+        7 => "★★★★★★★ Contraband",
+        6 => "★★★★★★ Covert",
+        5 => "★★★★★ Classified",
+        4 => "★★★★ Restricted",
+        3 => "★★★ Mil-Spec",
+        2 => "★★ Industrial",
+        _ => "★ Consumer"
+    };
+
+    public string RarityColor => Rarity switch
+    {
+        7 => "#FFD700",  // Gold
+        6 => "#EB4B4B",  // Red
+        5 => "#D32CE6",  // Purple
+        4 => "#4B69FF",  // Blue
+        3 => "#5E98D9",  // Light blue
+        2 => "#B0C3D9",  // Silver
+        _ => "#666666"
+    };
 }

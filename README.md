@@ -1,43 +1,94 @@
-# FoxSense | CS2 External ESP & Aimbot
+# 🦊 FoxSense — CS2 External Cheat
 
-FoxSense is a high-performance, undetectable external multi-cheat for Counter-Strike 2. Built in C# with a focus on stealth and performance, it leverages direct syscalls and a low-latency threading model to provide a silky-smooth experience.
+A fully external Counter-Strike 2 cheat built in C# / WPF. Operates entirely in userland with no DLL injection, no hooks, and no kernel drivers.
 
-## ✨ Features
+## Features
 
-- **Professional ESP:**
-  - **Box & Skeleton:** High-fidelity player boxes and skeleton bone rendering.
-  - **Health & Info:** Dynamic health bars, player names, and distance tracking.
-  - **Snaplines:** Tactical lines pointing to enemy locations.
-- **Precision Soft Aimbot:**
-  - **FOV-Based:** Configurable field of view with on-screen visualization.
-  - **Smooth Smoothing:** Exponential convergence curve for human-like movement.
-  - **Bone Targeting:** Selectable target bones (Head, Neck, Chest).
-- **Stealth Architecture:**
-  - **Direct Syscalls:** Bypasses userland hooks by reading `ntdll.dll` from disk.
-  - **Read-Only Access:** Minimal process rights (`PROCESS_VM_READ` only) to minimize the detection surface.
-  - **External Drawing:** High-performance WPF `DrawingVisual` overlay.
+### 👁 ESP (Extra Sensory Perception)
+- **Box ESP** — 2D bounding boxes around players
+- **Skeleton ESP** — Full bone skeleton rendering
+- **Health Bar** — Color-coded health indicators
+- **Name ESP** — Player name tags
+- **Distance** — Distance in meters
+- **Snap Lines** — Lines from crosshair to targets
+- **Enemy-only filtering**
+- **Custom RGB color** per-element
 
-## 🚀 Performance
+### 🎯 Soft Aimbot
+- Configurable **FOV radius** (20–250)
+- Adjustable **smoothing** (1–15)
+- Bone target selection (Head / Neck / Chest)
+- Custom aim key binding
+- FOV circle visualization
+- Enemy-only targeting
 
-- **Game Thread:** Polling at 1000Hz for near-real-time entity synchronization.
-- **Aimbot Thread:** High-priority 500Hz loop for precision corrections.
-- **Rendering:** VSync-locked overlay using `CompositionTarget.Rendering`.
+### 🎨 Skin Changer
+- **Real-time skin database** fetched from community API
+- Skin preview images in selection list
+- Supports **legacy model skins** (Asiimov, Dragon Lore, etc.)
+- Aggressive mesh mask override for instant application
+- Attribute injection via `RegenerateWeaponSkins`
+- No team switch required — skins apply instantly
 
-## 🛠️ Installation & Usage
+## Architecture
 
-1. **Clone the repository:**
-   ```bash
-   git clone git@github.com:dragonblz/CS2-ESP.git
-   ```
-2. **Build:** Open the solution in Visual Studio 2022 and build as **Release x64**.
-3. **Run CS2:** Set game mode to **Windowed** or **Windowed Fullscreen**.
-4. **Launch FoxSense:** Run the executable. Use the GUI to configure your settings.
-5. **Hotkey:** Use the Left Alt key (default) to toggle the GUI.
+```
+FoxSense/
+├── Core/
+│   ├── Memory.cs          # Process memory R/W via Win32 API
+│   ├── Offsets.cs          # Game offsets + bone indices
+│   ├── SkinOffsets.cs      # Skin changer specific offsets
+│   └── OffsetUpdater.cs    # Auto-update offsets from API
+├── Features/
+│   ├── EspRenderer.cs      # WPF overlay rendering
+│   ├── SoftAim.cs          # Aimbot logic + mouse movement
+│   ├── SkinChanger.cs      # Paint kit injection engine
+│   └── SkinDatabase.cs     # Skin catalog from API
+├── Game/
+│   ├── GameState.cs        # Entity list + bone reading
+│   ├── ViewMatrix.cs       # World-to-screen projection
+│   └── PlayerData.cs       # Player data structures
+├── Overlay/
+│   └── OverlayWindow.cs    # Transparent WPF overlay
+└── UI/
+    └── MainWindow.xaml      # Professional sidebar GUI
+```
 
-## ⚖️ Disclaimer
+## GUI
 
-This software is for educational purposes only. Use at your own risk. The developers are not responsible for any bans or consequences resulting from the use of this software.
+Professional dark-themed interface with:
+- **Left sidebar** navigation (ESP / Aimbot / Skins / Settings)
+- **Pill-style toggle switches**
+- **Grouped settings** in dark card sections
+- **Deep navy color palette**
+- Draggable, borderless window
+- GUI toggle hotkey (default: LAlt)
 
----
+## Requirements
 
-*Engineered for performance. Designed for stealth.*
+- Windows 10/11
+- .NET 8.0 Runtime
+- Counter-Strike 2 (Steam)
+- Run as **Administrator**
+
+## Building
+
+```bash
+dotnet build --configuration Release
+```
+
+## Anti-Cheat Notes
+
+- **Fully external** — no DLL injection
+- **Userland only** — no kernel drivers
+- Reads game memory via `ReadProcessMemory`
+- Skin changer uses temporary remote memory allocation
+- No persistent hooks or code patches
+
+## Disclaimer
+
+This project is for **educational purposes only**. Use at your own risk. The authors are not responsible for any bans or consequences resulting from the use of this software.
+
+## License
+
+MIT
