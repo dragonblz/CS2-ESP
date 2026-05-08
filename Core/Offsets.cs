@@ -2,8 +2,9 @@ namespace FoxSense.Core;
 
 /// <summary>
 /// All offsets verified against cs2-dumper (2026-04-30 dump).
+/// Re-verified on 2026-05-08 — no changes detected.
 /// Source: offsets.hpp + client_dll.hpp
-/// Bone indices updated for post-April-2026 animgraph_2_beta build.
+/// Bone indices: animgraph_2_beta (April 2026) — PELVIS=1, HEAD=7, hips=17/20.
 /// </summary>
 public static class Offsets
 {
