@@ -164,9 +164,46 @@ public sealed class Memory : IDisposable
     //  ATTACH & READ
     // ═══════════════════════════════════════════════════
 
+    /// <summary>
+    /// Checks if the attached process is still alive.
+    /// Call this periodically to detect CS2 restarts/updates.
+    /// </summary>
+    public bool ValidateConnection()
+    {
+        if (!IsAttached) return false;
+        try
+        {
+            var proc = Process.GetProcessById(Pid);
+            if (proc.HasExited) { Detach(); return false; }
+            return true;
+        }
+        catch { Detach(); return false; }
+    }
+
+    /// <summary>
+    /// Resets connection state so we can re-attach after CS2 restarts.
+    /// </summary>
+    public void Detach()
+    {
+        if (Handle != IntPtr.Zero)
+        {
+            CloseHandle(Handle);
+            Handle = IntPtr.Zero;
+        }
+        ClientBase = IntPtr.Zero;
+        Pid = 0;
+        IsAttached = false;
+    }
+
     public bool Attach()
     {
-        if (IsAttached) return true;
+        // If we think we're attached, verify the process is still alive
+        if (IsAttached)
+        {
+            if (ValidateConnection()) return true;
+            // Process died — fall through to re-attach
+        }
+
         if (_sysRead == null && !InitSyscall()) return false;
 
         var procs = Process.GetProcessesByName(Decode(TargetProc));
@@ -177,6 +214,7 @@ public sealed class Memory : IDisposable
         if (Handle == IntPtr.Zero) return false;
 
         string modName = Decode(TargetModule);
+        ClientBase = IntPtr.Zero;
         try
         {
             foreach (ProcessModule mod in procs[0].Modules)
