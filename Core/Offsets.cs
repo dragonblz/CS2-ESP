@@ -1,19 +1,18 @@
 namespace FoxSense.Core;
 
 /// <summary>
-/// All offsets verified against cs2-dumper (2026-04-30 dump).
-/// Re-verified on 2026-05-08 — no changes detected.
-/// Source: offsets.hpp + client_dll.hpp
-/// Bone indices: animgraph_2_beta (April 2026) — PELVIS=1, HEAD=7, hips=17/20.
+/// Offsets updated to Build 14160 (2026-05-08 ExitScam dump).
+/// Source: sezzyaep/CS2-OFFSETS + client_dll.hpp
+/// Bone indices: animgraph_2_beta — PELVIS=1, HEAD=7, hips=17/20.
 /// </summary>
 public static class Offsets
 {
-    // ── Base offsets (relative to client.dll, offsets.hpp 2026-04-30) ──
-    public const int dwEntityList            = 0x24D1DF0;
-    public const int dwLocalPlayerController = 0x230B5D0;
-    public const int dwViewMatrix            = 0x2331B30;
-    public const int dwLocalPlayerPawn       = 0x2057720;
-    public const int dwViewAngles            = 0x2341488;
+    // ── Base offsets (relative to client.dll, Build 14160 — 2026-05-08) ──
+    public const int dwEntityList            = 0x24D0DC0;
+    public const int dwLocalPlayerController = 0x230A4F0;
+    public const int dwViewMatrix            = 0x2330AE0;
+    public const int dwLocalPlayerPawn       = 0x2056700;
+    public const int dwViewAngles            = 0x2340288;
 
     // ── Controller (CCSPlayerController) ──
     public const int m_hPawn          = 0x6BC;   // CHandle<C_BasePlayerPawn>
