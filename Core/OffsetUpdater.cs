@@ -1,35 +1,24 @@
 using System.IO;
 using System.Net.Http;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 
 namespace FoxSense.Core;
 
 /// <summary>
-/// Auto-fetches the latest offsets from sezzyaep/CS2-OFFSETS on startup.
-/// Parses C++ .hpp format (constexpr std::ptrdiff_t name = 0xHEX;)
-/// Falls back to a2x/cs2-dumper JSON if primary fails, then to hardcoded values.
+/// Auto-fetches the latest offsets from a2x/cs2-dumper on startup.
+/// Parses JSON format from the cs2-dumper output directory.
 /// Caches fetched data to %APPDATA%/FoxSense/ for offline use.
 /// </summary>
 public static class OffsetUpdater
 {
-    private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(8) };
+    private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(10) };
 
     private static readonly string _cacheDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "FoxSense");
 
-    // Primary source — sezzyaep (updates fastest, uses .hpp format)
-    private const string PRIMARY_OFFSETS = "https://raw.githubusercontent.com/sezzyaep/CS2-OFFSETS/main/offsets.hpp";
-    private const string PRIMARY_CLIENT = "https://raw.githubusercontent.com/sezzyaep/CS2-OFFSETS/main/client_dll.hpp";
-
-    // Secondary source — a2x (JSON format)
-    private const string SECONDARY_OFFSETS = "https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/offsets.json";
-    private const string SECONDARY_CLIENT = "https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/client_dll.json";
-
-    // Regex for parsing C++ hpp: constexpr std::ptrdiff_t NAME = 0xHEX;
-    private static readonly Regex HppRegex = new(
-        @"constexpr\s+std::ptrdiff_t\s+(\w+)\s*=\s*(0x[0-9A-Fa-f]+)\s*;",
-        RegexOptions.Compiled);
+    // a2x/cs2-dumper — primary source (most reliable, always up to date)
+    private const string A2X_OFFSETS = "https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/offsets.json";
+    private const string A2X_CLIENT = "https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/client_dll.json";
 
     /// <summary>
     /// Fetches and applies the latest offsets. Call once at startup.
@@ -40,58 +29,24 @@ public static class OffsetUpdater
         Directory.CreateDirectory(_cacheDir);
         bool updated = false;
 
-        // Try primary (.hpp) → secondary (.json) → cache
-        string? offsetsHpp = await TryFetch(PRIMARY_OFFSETS);
-        string? clientHpp = await TryFetch(PRIMARY_CLIENT);
-
-        if (offsetsHpp != null)
+        // Fetch offsets.json (dwEntityList, dwLocalPlayerPawn, dwViewMatrix, etc.)
+        string? offsetsJson = await TryFetch(A2X_OFFSETS)
+                           ?? TryReadCache("offsets.json");
+        if (offsetsJson != null)
         {
-            ApplyHppOffsets(offsetsHpp);
-            SaveCache("offsets.hpp", offsetsHpp);
+            ApplyBaseOffsets(offsetsJson);
+            SaveCache("offsets.json", offsetsJson);
             updated = true;
         }
-        else
-        {
-            // Try secondary JSON source
-            string? offsetsJson = await TryFetch(SECONDARY_OFFSETS)
-                               ?? TryReadCache("offsets.json");
-            if (offsetsJson != null)
-            {
-                ApplyBaseOffsetsJson(offsetsJson);
-                SaveCache("offsets.json", offsetsJson);
-                updated = true;
-            }
-            else
-            {
-                // Try cached hpp
-                string? cached = TryReadCache("offsets.hpp");
-                if (cached != null) { ApplyHppOffsets(cached); updated = true; }
-            }
-        }
 
-        if (clientHpp != null)
+        // Fetch client_dll.json (m_iHealth, m_iTeamNum, m_AttributeManager, etc.)
+        string? clientJson = await TryFetch(A2X_CLIENT)
+                          ?? TryReadCache("client_dll.json");
+        if (clientJson != null)
         {
-            ApplyHppClientOffsets(clientHpp);
-            SaveCache("client_dll.hpp", clientHpp);
+            ApplyClientOffsets(clientJson);
+            SaveCache("client_dll.json", clientJson);
             updated = true;
-        }
-        else
-        {
-            // Try secondary JSON source
-            string? clientJson = await TryFetch(SECONDARY_CLIENT)
-                              ?? TryReadCache("client_dll.json");
-            if (clientJson != null)
-            {
-                ApplySkinOffsetsJson(clientJson);
-                SaveCache("client_dll.json", clientJson);
-                updated = true;
-            }
-            else
-            {
-                // Try cached hpp
-                string? cached = TryReadCache("client_dll.hpp");
-                if (cached != null) { ApplyHppClientOffsets(cached); updated = true; }
-            }
         }
 
         return updated;
@@ -120,100 +75,12 @@ public static class OffsetUpdater
     }
 
     // ═══════════════════════════════════════════════════
-    //  HPP PARSER (sezzyaep format)
+    //  APPLY BASE OFFSETS (offsets.json)
+    //  Contains: dwEntityList, dwLocalPlayerController,
+    //  dwLocalPlayerPawn, dwViewMatrix, dwViewAngles, etc.
     // ═══════════════════════════════════════════════════
 
-    private static Dictionary<string, int> ParseHpp(string hpp)
-    {
-        var result = new Dictionary<string, int>();
-        foreach (Match m in HppRegex.Matches(hpp))
-        {
-            string name = m.Groups[1].Value;
-            if (int.TryParse(m.Groups[2].Value[2..], System.Globalization.NumberStyles.HexNumber, null, out int val))
-                result[name] = val;
-        }
-        return result;
-    }
-
-    // ═══════════════════════════════════════════════════
-    //  APPLY HPP BASE OFFSETS (offsets.hpp)
-    // ═══════════════════════════════════════════════════
-
-    private static void ApplyHppOffsets(string hpp)
-    {
-        var offsets = ParseHpp(hpp);
-
-        TryApply(offsets, "dwEntityList", v => Offsets.dwEntityList = v);
-        TryApply(offsets, "dwLocalPlayerController", v => Offsets.dwLocalPlayerController = v);
-        TryApply(offsets, "dwLocalPlayerPawn", v => Offsets.dwLocalPlayerPawn = v);
-        TryApply(offsets, "dwViewMatrix", v => Offsets.dwViewMatrix = v);
-        TryApply(offsets, "dwViewAngles", v => Offsets.dwViewAngles = v);
-
-        // Engine2
-        TryApply(offsets, "dwNetworkGameClient", v => SkinOffsets.dwNetworkGameClient = v);
-        TryApply(offsets, "dwNetworkGameClient_deltaTick", v => SkinOffsets.dwNetworkGameClient_deltaTick = v);
-    }
-
-    // ═══════════════════════════════════════════════════
-    //  APPLY HPP CLIENT OFFSETS (client_dll.hpp)
-    // ═══════════════════════════════════════════════════
-
-    private static void ApplyHppClientOffsets(string hpp)
-    {
-        var offsets = ParseHpp(hpp);
-
-        // Weapon services
-        TryApply(offsets, "m_pWeaponServices", v => SkinOffsets.m_pWeaponServices = v);
-        TryApply(offsets, "m_hMyWeapons", v => SkinOffsets.m_hMyWeapons = v);
-        TryApply(offsets, "m_hActiveWeapon", v => SkinOffsets.m_hActiveWeapon = v);
-
-        // Econ entity — NOTE: hpp may have multiple m_AttributeManager from different classes.
-        // We handle this by only applying values we can verify are from the right class.
-        // The fallback values are already set to sezzyaep Build 14160.
-
-        // Fallback paints (these are unique field names, safe to apply)
-        TryApply(offsets, "m_nFallbackPaintKit", v => SkinOffsets.m_nFallbackPaintKit = v);
-        TryApply(offsets, "m_nFallbackSeed", v => SkinOffsets.m_nFallbackSeed = v);
-        TryApply(offsets, "m_flFallbackWear", v => SkinOffsets.m_flFallbackWear = v);
-        TryApply(offsets, "m_nFallbackStatTrak", v => SkinOffsets.m_nFallbackStatTrak = v);
-        TryApply(offsets, "m_OriginalOwnerXuidLow", v => SkinOffsets.m_OriginalOwnerXuidLow = v);
-
-        // Econ item view
-        TryApply(offsets, "m_iItemDefinitionIndex", v => SkinOffsets.m_iItemDefinitionIndex = v);
-        TryApply(offsets, "m_iItemIDHigh", v => SkinOffsets.m_iItemIDHigh = v);
-        TryApply(offsets, "m_iAccountID", v => SkinOffsets.m_iAccountID = v);
-        TryApply(offsets, "m_iEntityQuality", v => SkinOffsets.m_iEntityQuality = v);
-        TryApply(offsets, "m_bInitialized", v => SkinOffsets.m_bInitialized = v);
-        TryApply(offsets, "m_AttributeList", v => SkinOffsets.m_AttributeList = v);
-        TryApply(offsets, "m_NetworkedDynamicAttributes", v => SkinOffsets.m_NetworkedDynamicAttributes = v);
-        TryApply(offsets, "m_Attributes", v => SkinOffsets.m_Attributes = v);
-        TryApply(offsets, "m_Item", v => SkinOffsets.m_Item = v);
-
-        // Knife / Glove
-        TryApply(offsets, "m_nSubclassID", v => SkinOffsets.m_nSubclassID = v);
-        TryApply(offsets, "m_bNeedToReApplyGloves", v => SkinOffsets.m_bNeedToReApplyGloves = v);
-        TryApply(offsets, "m_hOwnerEntity", v => SkinOffsets.m_hOwnerEntity = v);
-        TryApply(offsets, "m_MeshGroupMask", v => SkinOffsets.m_MeshGroupMask = v);
-
-        // Model
-        TryApply(offsets, "m_pGameSceneNode", v => { SkinOffsets.m_pGameSceneNode_skin = v; Offsets.m_pGameSceneNode = v; });
-        TryApply(offsets, "m_modelState", v => SkinOffsets.m_modelState_skin = v);
-
-        // Pawn offsets (also update ESP offsets)
-        TryApply(offsets, "m_iHealth", v => Offsets.m_iHealth = v);
-        TryApply(offsets, "m_iTeamNum", v => Offsets.m_iTeamNum = v);
-        TryApply(offsets, "m_vOldOrigin", v => Offsets.m_vOldOrigin = v);
-
-        // Inventory
-        TryApply(offsets, "m_pInventoryServices", v => SkinOffsets.m_pInventoryServices = v);
-        TryApply(offsets, "m_unMusicID", v => SkinOffsets.m_unMusicID = v);
-    }
-
-    // ═══════════════════════════════════════════════════
-    //  JSON PARSERS (a2x fallback)
-    // ═══════════════════════════════════════════════════
-
-    private static void ApplyBaseOffsetsJson(string json)
+    private static void ApplyBaseOffsets(string json)
     {
         try
         {
@@ -222,23 +89,28 @@ public static class OffsetUpdater
 
             if (root.TryGetProperty("client.dll", out var client))
             {
-                TrySetJson(client, "dwEntityList", v => Offsets.dwEntityList = v);
-                TrySetJson(client, "dwLocalPlayerController", v => Offsets.dwLocalPlayerController = v);
-                TrySetJson(client, "dwLocalPlayerPawn", v => Offsets.dwLocalPlayerPawn = v);
-                TrySetJson(client, "dwViewMatrix", v => Offsets.dwViewMatrix = v);
-                TrySetJson(client, "dwViewAngles", v => Offsets.dwViewAngles = v);
+                TrySet(client, "dwEntityList", v => Offsets.dwEntityList = v);
+                TrySet(client, "dwLocalPlayerController", v => Offsets.dwLocalPlayerController = v);
+                TrySet(client, "dwLocalPlayerPawn", v => Offsets.dwLocalPlayerPawn = v);
+                TrySet(client, "dwViewMatrix", v => Offsets.dwViewMatrix = v);
+                TrySet(client, "dwViewAngles", v => Offsets.dwViewAngles = v);
             }
 
             if (root.TryGetProperty("engine2.dll", out var engine))
             {
-                TrySetJson(engine, "dwNetworkGameClient", v => SkinOffsets.dwNetworkGameClient = v);
-                TrySetJson(engine, "dwNetworkGameClient_deltaTick", v => SkinOffsets.dwNetworkGameClient_deltaTick = v);
+                TrySet(engine, "dwNetworkGameClient", v => SkinOffsets.dwNetworkGameClient = v);
+                TrySet(engine, "dwNetworkGameClient_deltaTick", v => SkinOffsets.dwNetworkGameClient_deltaTick = v);
             }
         }
         catch { }
     }
 
-    private static void ApplySkinOffsetsJson(string json)
+    // ═══════════════════════════════════════════════════
+    //  APPLY CLIENT OFFSETS (client_dll.json)
+    //  Contains class-based offsets for all game entities.
+    // ═══════════════════════════════════════════════════
+
+    private static void ApplyClientOffsets(string json)
     {
         try
         {
@@ -246,24 +118,55 @@ public static class OffsetUpdater
             if (!doc.RootElement.TryGetProperty("client.dll", out var dll)) return;
             if (!dll.TryGetProperty("classes", out var classes)) return;
 
+            // ── ESP offsets ──
+            TrySetField(classes, "C_BaseEntity", "m_pGameSceneNode", v =>
+            {
+                Offsets.m_pGameSceneNode = v;
+                SkinOffsets.m_pGameSceneNode_skin = v;
+            });
+            TrySetField(classes, "C_BaseEntity", "m_iHealth", v => Offsets.m_iHealth = v);
+            TrySetField(classes, "C_BaseEntity", "m_iTeamNum", v => Offsets.m_iTeamNum = v);
+            TrySetField(classes, "C_BasePlayerPawn", "m_vOldOrigin", v => Offsets.m_vOldOrigin = v);
+            TrySetField(classes, "CGameSceneNode", "m_vecAbsOrigin", v => { /* Offsets.m_vecAbsOrigin = v; */ });
+            TrySetField(classes, "CSkeletonInstance", "m_modelState", v => SkinOffsets.m_modelState_skin = v);
+
+            // ── Weapon services ──
+            TrySetField(classes, "C_BasePlayerPawn", "m_pWeaponServices", v => SkinOffsets.m_pWeaponServices = v);
+            TrySetField(classes, "CPlayer_WeaponServices", "m_hMyWeapons", v => SkinOffsets.m_hMyWeapons = v);
+            TrySetField(classes, "CPlayer_WeaponServices", "m_hActiveWeapon", v => SkinOffsets.m_hActiveWeapon = v);
+
+            // ── Econ entity (skin changer) ──
             TrySetField(classes, "C_EconEntity", "m_AttributeManager", v => SkinOffsets.m_AttributeManager = v);
             TrySetField(classes, "C_EconEntity", "m_nFallbackPaintKit", v => SkinOffsets.m_nFallbackPaintKit = v);
             TrySetField(classes, "C_EconEntity", "m_nFallbackSeed", v => SkinOffsets.m_nFallbackSeed = v);
             TrySetField(classes, "C_EconEntity", "m_flFallbackWear", v => SkinOffsets.m_flFallbackWear = v);
             TrySetField(classes, "C_EconEntity", "m_nFallbackStatTrak", v => SkinOffsets.m_nFallbackStatTrak = v);
+            TrySetField(classes, "C_EconEntity", "m_OriginalOwnerXuidLow", v => SkinOffsets.m_OriginalOwnerXuidLow = v);
+
+            // ── Attribute container ──
             TrySetField(classes, "C_AttributeContainer", "m_Item", v => SkinOffsets.m_Item = v);
+
+            // ── Econ item view ──
             TrySetField(classes, "C_EconItemView", "m_iItemDefinitionIndex", v => SkinOffsets.m_iItemDefinitionIndex = v);
             TrySetField(classes, "C_EconItemView", "m_iItemIDHigh", v => SkinOffsets.m_iItemIDHigh = v);
             TrySetField(classes, "C_EconItemView", "m_iAccountID", v => SkinOffsets.m_iAccountID = v);
             TrySetField(classes, "C_EconItemView", "m_iEntityQuality", v => SkinOffsets.m_iEntityQuality = v);
             TrySetField(classes, "C_EconItemView", "m_bInitialized", v => SkinOffsets.m_bInitialized = v);
-            TrySetField(classes, "C_BaseEntity", "m_nSubclassID", v => SkinOffsets.m_nSubclassID = v);
+
+            // ── Attribute list ──
+            TrySetField(classes, "CAttributeList", "m_Attributes", v => SkinOffsets.m_Attributes = v);
+
+            // ── Model state ──
             TrySetField(classes, "CModelState", "m_MeshGroupMask", v => SkinOffsets.m_MeshGroupMask = v);
-            TrySetField(classes, "C_BaseEntity", "m_pGameSceneNode", v => { SkinOffsets.m_pGameSceneNode_skin = v; Offsets.m_pGameSceneNode = v; });
-            TrySetField(classes, "CSkeletonInstance", "m_modelState", v => SkinOffsets.m_modelState_skin = v);
-            TrySetField(classes, "C_BasePlayerPawn", "m_pWeaponServices", v => SkinOffsets.m_pWeaponServices = v);
-            TrySetField(classes, "CPlayer_WeaponServices", "m_hMyWeapons", v => SkinOffsets.m_hMyWeapons = v);
-            TrySetField(classes, "CPlayer_WeaponServices", "m_hActiveWeapon", v => SkinOffsets.m_hActiveWeapon = v);
+
+            // ── Misc ──
+            TrySetField(classes, "C_BaseEntity", "m_nSubclassID", v => SkinOffsets.m_nSubclassID = v);
+            TrySetField(classes, "CCSPlayerController_InventoryServices", "m_unMusicID", v => SkinOffsets.m_unMusicID = v);
+
+            // ── Controller → pawn link ──
+            TrySetField(classes, "CBasePlayerController", "m_hPawn", v => Offsets.m_hPawn = v);
+            TrySetField(classes, "CCSPlayerController", "m_hPlayerPawn", v => Offsets.m_hPawn_Fallback = v);
+            TrySetField(classes, "CBasePlayerController", "m_iszPlayerName", v => Offsets.m_iszPlayerName = v);
         }
         catch { }
     }
@@ -272,13 +175,7 @@ public static class OffsetUpdater
     //  HELPERS
     // ═══════════════════════════════════════════════════
 
-    private static void TryApply(Dictionary<string, int> offsets, string key, Action<int> setter)
-    {
-        if (offsets.TryGetValue(key, out int val))
-            setter(val);
-    }
-
-    private static void TrySetJson(JsonElement parent, string key, Action<int> setter)
+    private static void TrySet(JsonElement parent, string key, Action<int> setter)
     {
         if (parent.TryGetProperty(key, out var val) && val.ValueKind == JsonValueKind.Number)
             setter((int)val.GetInt64());

@@ -1,8 +1,8 @@
 namespace FoxSense.Core;
 
 /// <summary>
-/// Offsets updated to Build 14160 (2026-05-08 ExitScam dump).
-/// Source: sezzyaep/CS2-OFFSETS + client_dll.hpp
+/// Offsets — defaults from Build 14160 (2026-05-08).
+/// Auto-updated from a2x/cs2-dumper at startup.
 /// Bone indices: animgraph_2_beta — PELVIS=1, HEAD=7, hips=17/20.
 /// </summary>
 public static class Offsets
@@ -16,9 +16,9 @@ public static class Offsets
     public static int dwViewAngles            = 0x2340288;
 
     // ── Controller (CCSPlayerController) ──
-    public const int m_hPawn          = 0x6BC;   // CHandle<C_BasePlayerPawn>
-    public const int m_hPawn_Fallback = 0x904;   // CHandle<C_CSPlayerPawn>
-    public const int m_iszPlayerName  = 0x6F0;   // char[128]
+    public static int m_hPawn          = 0x6BC;   // CHandle<C_BasePlayerPawn>
+    public static int m_hPawn_Fallback = 0x904;   // CHandle<C_CSPlayerPawn>
+    public static int m_iszPlayerName  = 0x6F0;   // char[128]
 
     // ── Pawn (C_CSPlayerPawn) ──
     public static int m_iHealth         = 0x34C;  // int32

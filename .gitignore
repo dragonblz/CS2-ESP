@@ -1,23 +1,8 @@
-# Build outputs
-bin/
-obj/
-
-# IDE
-.vs/
+[bin]
+[obj]
 *.user
 *.suo
-*.cache
-
-# OS
-Thumbs.db
-.DS_Store
-
-# Dumps
-*.hpp
-*.dmp
-
-# Logs
+*.pdb
 *.log
-
-# Skin cache
-skins_cache.json
+.vs/
+.gemini/

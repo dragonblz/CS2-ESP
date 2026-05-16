@@ -40,11 +40,8 @@ public class SkinChanger
     // Attribute struct size (CEconItemAttribute = 0x48 bytes)
     private const int ATTR_SIZE = 0x48;
 
-    // HUD flag (from reference: #define HideHudFlag 128)
-    private const uint HideHudFlag = 128;
-
-    // Track knife weapons for HUD update
-    private readonly List<long> _knifeWeapons = new();
+    // Track remote memory allocations for safe cleanup
+    private readonly List<long> _allocatedBlocks = new();
 
     public void SetWeaponSkin(ushort weaponDefIndex, SkinInfo skin)
     {
@@ -97,85 +94,95 @@ public class SkinChanger
         if (!Enabled || !mem.IsAttached || !mem.HasWriteAccess || !state.InGame)
             return;
 
-        if (!_initialized)
-            Initialize(mem);
-
-        long localPawn = state.LocalPawn;
-        if (localPawn == 0) return;
-
-        int health = mem.Read<int>(localPawn + Offsets.m_iHealth);
-        if (health <= 0) return;
-
-        long weaponServices = mem.Read<long>(localPawn + SkinOffsets.m_pWeaponServices);
-        if (weaponServices == 0 || weaponServices < 0x10000) return;
-
-        bool shouldUpdate = false;
-        var weapons = GetWeaponEntities(mem, weaponServices);
-
-        foreach (long weapon in weapons)
+        try
         {
-            if (weapon == 0 || weapon < 0x10000) continue;
+            if (!_initialized)
+                Initialize(mem);
 
-            long item = weapon + SkinOffsets.m_AttributeManager + SkinOffsets.m_Item;
+            long localPawn = state.LocalPawn;
+            if (localPawn == 0) return;
 
-            // ForceUpdate: reset m_iItemIDHigh to 0 to trigger re-apply
-            if (ForceUpdate)
-                mem.Write<uint>(item + SkinOffsets.m_iItemIDHigh, 0);
-
-            // Already applied? Skip.
-            if (mem.Read<uint>(item + SkinOffsets.m_iItemIDHigh) == 0xFFFFFFFF)
-                continue;
-
-            // Mark as applied
-            mem.Write<uint>(item + SkinOffsets.m_iItemIDHigh, 0xFFFFFFFF);
-
-            ushort defIndex = mem.Read<ushort>(item + SkinOffsets.m_iItemDefinitionIndex);
-            if (defIndex == 0) continue;
-
-            // Look up skin for this weapon
-            SkinInfo? skin = null;
-
-            // Skip knives/grenades — only apply to regular weapons
-            // External knife model changes require injection (not safe)
-            if (DefaultKnives.Contains(defIndex))
+            int health = mem.Read<int>(localPawn + Offsets.m_iHealth);
+            if (health <= 0)
             {
-                // Apply knife skin if configured (paint kit only, no model change)
-                if (SelectedKnifeSkin != null && SelectedKnifeSkin.PaintKit != 0)
-                    skin = SelectedKnifeSkin;
-                else
+                // Player is dead — clean up any pending allocations
+                CleanupAllocations(mem);
+                return;
+            }
+
+            long weaponServices = mem.Read<long>(localPawn + SkinOffsets.m_pWeaponServices);
+            if (weaponServices == 0 || weaponServices < 0x10000) return;
+
+            bool shouldUpdate = false;
+            var weapons = GetWeaponEntities(mem, weaponServices);
+
+            foreach (long weapon in weapons)
+            {
+                if (weapon == 0 || weapon < 0x10000) continue;
+
+                long item = weapon + SkinOffsets.m_AttributeManager + SkinOffsets.m_Item;
+
+                // ForceUpdate: reset m_iItemIDHigh to 0 to trigger re-apply
+                if (ForceUpdate)
+                    mem.Write<uint>(item + SkinOffsets.m_iItemIDHigh, 0);
+
+                // Already applied? Skip.
+                if (mem.Read<uint>(item + SkinOffsets.m_iItemIDHigh) == 0xFFFFFFFF)
                     continue;
+
+                // Mark as applied
+                mem.Write<uint>(item + SkinOffsets.m_iItemIDHigh, 0xFFFFFFFF);
+
+                ushort defIndex = mem.Read<ushort>(item + SkinOffsets.m_iItemDefinitionIndex);
+                if (defIndex == 0) continue;
+
+                // Look up skin for this weapon
+                SkinInfo? skin = null;
+
+                if (DefaultKnives.Contains(defIndex))
+                {
+                    if (SelectedKnifeSkin != null && SelectedKnifeSkin.PaintKit != 0)
+                        skin = SelectedKnifeSkin;
+                    else
+                        continue;
+                }
+                else
+                {
+                    skin = GetConfiguredSkin(defIndex);
+                }
+
+                if (skin == null || skin.PaintKit == 0) continue;
+
+                // Write fallback paint kit
+                mem.Write<int>(weapon + SkinOffsets.m_nFallbackPaintKit, skin.PaintKit);
+
+                // Mesh mask (legacy model = 2, normal = 1)
+                ulong mask = (ulong)(skin.LegacyModel ? 2 : 1);
+                SetMeshMask(mem, weapon, mask);
+
+                // Also set HUD weapon mesh mask
+                long hudWeapon = GetHudWeapon(mem, localPawn, weapon);
+                if (hudWeapon != 0)
+                    SetMeshMask(mem, hudWeapon, mask);
+
+                // Create attribute list entries
+                CreateAttributes(mem, item, skin.PaintKit);
+
+                LogDebug($"[SKIN] Applied PK={skin.PaintKit} def={defIndex} mask={mask}");
+                shouldUpdate = true;
             }
-            else
-            {
-                skin = GetConfiguredSkin(defIndex);
-            }
 
-            if (skin == null || skin.PaintKit == 0) continue;
+            // Call RegenerateWeaponSkins + cleanup
+            if (shouldUpdate || ForceUpdate)
+                UpdateWeapons(mem, weapons);
 
-            // Write fallback paint kit
-            mem.Write<int>(weapon + SkinOffsets.m_nFallbackPaintKit, skin.PaintKit);
-
-            // Mesh mask (legacy model = 2, normal = 1)
-            ulong mask = (ulong)(skin.LegacyModel ? 2 : 1);
-            SetMeshMask(mem, weapon, mask);
-
-            // Also set HUD weapon mesh mask (for first-person viewmodel)
-            long hudWeapon = GetHudWeapon(mem, localPawn, weapon);
-            if (hudWeapon != 0)
-                SetMeshMask(mem, hudWeapon, mask);
-
-            // Create attribute list entries
-            CreateAttributes(mem, item, skin.PaintKit);
-
-            LogDebug($"[SKIN] Applied PK={skin.PaintKit} def={defIndex} mask={mask}");
-            shouldUpdate = true;
+            ForceUpdate = false;
         }
-
-        // Call RegenerateWeaponSkins + cleanup
-        if (shouldUpdate || ForceUpdate)
-            UpdateWeapons(mem, weapons);
-
-        ForceUpdate = false;
+        catch (Exception ex)
+        {
+            LogDebug($"[SKIN] Error: {ex.Message}");
+            CleanupAllocations(mem);
+        }
     }
 
     // ═══════════════════════════════════════════════════
@@ -191,40 +198,31 @@ public class SkinChanger
             LogDebug("[SKIN] Called RegenerateWeaponSkins");
         }
 
-        // Cleanup: reset FallbackPaintKit to -1 and remove attributes
-        // (matching reference's UpdateWeapons exactly)
+        // IMMEDIATELY clean up all remote allocations
+        // This MUST happen right after the call, before death can destroy entities
+        CleanupAllocations(mem);
+
+        // Reset fallback paint kit
         foreach (long weapon in weapons)
         {
             if (weapon == 0 || weapon < 0x10000) continue;
-            long item = weapon + SkinOffsets.m_AttributeManager + SkinOffsets.m_Item;
-
-            if (mem.Read<int>(weapon + SkinOffsets.m_nFallbackPaintKit) == -1)
-                continue;
-
-            mem.Write<int>(weapon + SkinOffsets.m_nFallbackPaintKit, -1);
-            RemoveAttributes(mem, item);
-        }
-
-        // Force HUD refresh for knife weapons
-        foreach (long knife in _knifeWeapons)
-        {
-            UpdateHud(mem, knife);
+            try { mem.Write<int>(weapon + SkinOffsets.m_nFallbackPaintKit, -1); } catch { }
         }
     }
 
-    // ═══════════════════════════════════════════════════
-    //  HUD UPDATE (matching reference UpdateHud)
-    //  Flips entity identity flags to force HUD model refresh
-    // ═══════════════════════════════════════════════════
-
-    private static void UpdateHud(Memory mem, long weapon, int delay = 200)
+    /// <summary>
+    /// Safely frees all tracked remote memory allocations and zeros attribute pointers.
+    /// </summary>
+    private void CleanupAllocations(Memory mem)
     {
-        long identity = mem.Read<long>(weapon + SkinOffsets.m_pEntity);
-        if (identity == 0 || identity < 0x10000) return;
-
-        mem.Write<uint>(identity + SkinOffsets.m_flags, HideHudFlag);
-        Thread.Sleep(delay);
-        mem.Write<uint>(identity + SkinOffsets.m_flags, 0);
+        foreach (long block in _allocatedBlocks)
+        {
+            if (block > 0x10000)
+            {
+                try { mem.FreeRemote(block); } catch { }
+            }
+        }
+        _allocatedBlocks.Clear();
     }
 
     // ═══════════════════════════════════════════════════
@@ -245,6 +243,9 @@ public class SkinChanger
         int numAttrs = 3;
         long memBlock = mem.AllocateRemote((uint)(numAttrs * ATTR_SIZE));
         if (memBlock == 0) return;
+
+        // Track for cleanup
+        _allocatedBlocks.Add(memBlock);
 
         // Paint (defIndex=6)
         WriteAttr(mem, memBlock + 0 * ATTR_SIZE, 6, (float)paintKit);
