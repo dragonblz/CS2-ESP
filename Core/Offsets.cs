@@ -7,13 +7,13 @@ namespace FoxSense.Core;
 /// </summary>
 public static class Offsets
 {
-    // ── Base offsets (relative to client.dll, Build 14160 — 2026-05-08) ──
-    // These are static (not const) so OffsetUpdater can overwrite them at startup.
-    public static int dwEntityList            = 0x24D0DC0;
-    public static int dwLocalPlayerController = 0x230A4F0;
-    public static int dwViewMatrix            = 0x2330AE0;
-    public static int dwLocalPlayerPawn       = 0x2056700;
-    public static int dwViewAngles            = 0x2340288;
+    // ── Base offsets (sezzyaep/CS2-OFFSETS — auto-updated at startup) ──
+    // These are static so OffsetUpdater can overwrite them at startup.
+    public static int dwEntityList            = 0x24E5590;
+    public static int dwLocalPlayerController = 0x231CA80;
+    public static int dwViewMatrix            = 0x2344B30;
+    public static int dwLocalPlayerPawn       = 0x233F698;
+    public static int dwViewAngles            = 0x2350E68;
 
     // ── Controller (CCSPlayerController) ──
     public static int m_hPawn          = 0x6BC;   // CHandle<C_BasePlayerPawn>
