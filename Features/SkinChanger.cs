@@ -179,7 +179,8 @@ public class SkinChanger
                 shouldUpdate = true;
             }
 
-            if (shouldUpdate || ForceUpdate)
+            // Only call RegenerateWeaponSkins if we actually applied a skin this tick
+            if (shouldUpdate)
                 UpdateWeapons(mem, weapons);
 
             ForceUpdate = false;
@@ -204,7 +205,7 @@ public class SkinChanger
         // Cleanup MUST happen right after — zero game pointers then free blocks
         CleanupAllocations(mem);
 
-        // Reset fallback paint kit sentinel (so it doesn't stay permanently)
+        // Reset fallback paint kit sentinel
         foreach (long weapon in weapons)
         {
             if (weapon == 0 || weapon < 0x10000) continue;
@@ -344,27 +345,22 @@ public class SkinChanger
 
     // ═══════════════════════════════════════════════════
     //  WEAPON ENUMERATION
-    //  FIX: CNetworkUtlVectorBase layout is ptr@+0, count@+8 (int, not long).
-    //  Previous code had them swapped, so weapons were never found.
+    //  m_hMyWeapons is a fixed embedded handle array inside weapon services
+    //  (not a ptr+count vector). Iterate up to 64 slots directly.
     // ═══════════════════════════════════════════════════
 
     private static List<long> GetWeaponEntities(Memory mem, long weaponServices)
     {
         var result = new List<long>(16);
 
-        long arrayBase   = weaponServices + SkinOffsets.m_hMyWeapons;
-        long weaponEntry = mem.Read<long>(arrayBase);       // ptr to handle array  (was wrongly read as count)
-        int  weaponCount = mem.Read<int>(arrayBase + 8);    // element count as int (was wrongly read as ptr)
-
-        if (weaponCount <= 0 || weaponCount > 64 || weaponEntry < 0x10000)
-            return result;
-
         long entityList = mem.Read<long>(mem.ClientAddr(Offsets.dwEntityList));
         if (entityList == 0) return result;
 
-        for (int i = 0; i < weaponCount; i++)
+        long arrayBase = weaponServices + SkinOffsets.m_hMyWeapons;
+
+        for (int i = 0; i < 64; i++)
         {
-            int handle = mem.Read<int>(weaponEntry + i * 4);
+            int handle = mem.Read<int>(arrayBase + i * 4);
             if (handle == 0 || handle == -1) continue;
             long entity = EntityResolver.ResolvePawn(mem, entityList, handle);
             if (entity > 0x10000)
