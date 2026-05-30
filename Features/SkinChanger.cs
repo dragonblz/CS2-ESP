@@ -68,10 +68,19 @@ public class SkinChanger
 
         LogDebug($"[SKIN] RegenerateWeaponSkins @ 0x{_regenerateSkinsFn:X}");
 
-        // DO NOT patch the function body — patching +0x52 with 0x13E0 corrupts
-        // the function in post-May-2026 CS2 builds and causes an instant crash.
+        if (_regenerateSkinsFn != 0)
+        {
+            // Patch the 2-byte displacement in RegenerateWeaponSkins so it reads
+            // from weapon + m_AttributeManager + m_Item + m_AttributeList + m_Attributes.
+            // That location is EMPTY (we write no attribute structs), so the function
+            // naturally falls back to m_nFallbackPaintKit — no vtable crash.
+            ushort patchVal = (ushort)(SkinOffsets.m_AttributeManager + SkinOffsets.m_Item
+                                      + SkinOffsets.m_AttributeList + SkinOffsets.m_Attributes);
+            mem.Write<ushort>(_regenerateSkinsFn + 0x52, patchVal);
+            LogDebug($"[SKIN] Patched +0x52 = 0x{patchVal:X}");
+        }
 
-        _initialized = true; // mark done even if scan failed (avoids retry spam)
+        _initialized = true;
     }
 
     // ═══════════════════════════════════════════════════
