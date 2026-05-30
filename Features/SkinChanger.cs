@@ -44,10 +44,18 @@ public class SkinChanger
     private bool _initialized;
 
     // Attribute struct size (CEconItemAttribute = 0x48 bytes)
-    private const int ATTR_SIZE = 0x48;
+    private const int ATTR_SIZE     = 0x48;
+    private const int MAX_WEAPONS   = 16;
+    private const int ATTRS_PER_WPN = 3;
 
-    // Track (item-address-in-game, remote-block-address) pairs for proper cleanup
-    private readonly List<(long ItemAddr, long BlockAddr)> _allocatedBlocks = new();
+    // One persistent remote buffer — allocated once, NEVER freed during gameplay.
+    // Freeing attr memory while the engine's material system still reads it = crash.
+    private long _attrBuffer;   // base of remote allocation
+    private int  _attrSlot;     // next free slot index (reset each tick)
+
+    // Track which game item-addresses we wrote attribute pointers into,
+    // so we can zero them after RegenerateWeaponSkins finishes.
+    private readonly List<long> _writtenItemAddrs = new();
 
     public void SetWeaponSkin(ushort weaponDefIndex, SkinInfo skin)
     {
@@ -70,7 +78,6 @@ public class SkinChanger
 
     private void Initialize(Memory mem)
     {
-        // Don't mark initialized until we actually have the function address
         int clientSize = mem.GetModuleSize("client.dll");
         _regenerateSkinsFn = mem.SigScan(mem.ClientBase, clientSize,
             "48 83 EC ?? E8 ?? ?? ?? ?? 48 85 C0 0F 84 ?? ?? ?? ?? 48 8B 10");
@@ -80,16 +87,22 @@ public class SkinChanger
         if (_regenerateSkinsFn == 0)
         {
             LogDebug("[SKIN] Sig scan failed — will retry next tick");
-            return; // _initialized stays false, retry next tick
+            return;
         }
 
-        // Patch: tell RegenerateWeaponSkins where our attribute list is
+        // Patch offset inside function so it reads from our attr list
         ushort patchValue = (ushort)(SkinOffsets.m_AttributeManager + SkinOffsets.m_Item
                                      + SkinOffsets.m_AttributeList + SkinOffsets.m_Attributes);
         mem.Write<ushort>(_regenerateSkinsFn + 0x52, patchValue);
         LogDebug($"[SKIN] Patched +0x52 = 0x{patchValue:X}");
 
-        _initialized = true; // only set after success
+        // Allocate a single persistent remote buffer for attribute structs.
+        // Large enough for MAX_WEAPONS weapons × ATTRS_PER_WPN attributes each.
+        uint bufSize = (uint)(MAX_WEAPONS * ATTRS_PER_WPN * ATTR_SIZE);
+        _attrBuffer = mem.AllocateRemote(bufSize);
+        LogDebug($"[SKIN] Attr buffer @ 0x{_attrBuffer:X} ({bufSize} bytes)");
+
+        _initialized = (_attrBuffer != 0); // only mark ready if both succeeded
     }
 
     // ═══════════════════════════════════════════════════
@@ -121,6 +134,7 @@ public class SkinChanger
             long weaponServices = mem.Read<long>(localPawn + SkinOffsets.m_pWeaponServices);
             if (weaponServices == 0 || weaponServices < 0x10000) return;
 
+            _attrSlot = 0;           // reset slot counter each tick
             bool shouldUpdate = false;
             var weapons = GetWeaponEntities(mem, weaponServices);
 
@@ -198,50 +212,44 @@ public class SkinChanger
 
     private void UpdateWeapons(Memory mem, List<long> weapons)
     {
-        // Call RegenerateWeaponSkins in the game process
         mem.CallThread(_regenerateSkinsFn);
         LogDebug("[SKIN] Called RegenerateWeaponSkins");
 
-        // Cleanup MUST happen right after — zero game pointers then free blocks
-        CleanupAllocations(mem);
+        // Zero the game-side attribute list pointers ONLY.
+        // Do NOT free _attrBuffer — the engine may still be reading it
+        // in background threads even after the remote thread returns.
+        ZeroGameAttrPointers(mem);
 
         // Reset fallback paint kit sentinel
         foreach (long weapon in weapons)
         {
-            if (weapon == 0 || weapon < 0x10000) continue;
+            if (weapon < 0x10000) continue;
             try { mem.Write<int>(weapon + SkinOffsets.m_nFallbackPaintKit, -1); } catch { }
         }
     }
 
     // ═══════════════════════════════════════════════════
-    //  CLEANUP
-    //  BUG FIX: must zero game-memory pointers BEFORE freeing the remote block,
-    //  otherwise CreateAttributes sees stale non-zero ptr and permanently skips.
+    //  ATTR POINTER CLEANUP  (zeros game-side pointers, does NOT free remote buffer)
     // ═══════════════════════════════════════════════════
 
-    private void CleanupAllocations(Memory mem)
+    private void ZeroGameAttrPointers(Memory mem)
     {
-        foreach (var (itemAddr, blockAddr) in _allocatedBlocks)
+        foreach (long itemAddr in _writtenItemAddrs)
         {
-            // 1. Zero the game-side attribute list vector so CreateAttributes
-            //    doesn't think attributes already exist next application
-            if (itemAddr > 0x10000)
+            if (itemAddr < 0x10000) continue;
+            try
             {
-                try
-                {
-                    long attrListAddr = itemAddr + SkinOffsets.m_AttributeList + SkinOffsets.m_Attributes;
-                    mem.Write<long>(attrListAddr, 0);       // size = 0
-                    mem.Write<long>(attrListAddr + 8, 0);   // ptr = null
-                }
-                catch { }
+                long addr = itemAddr + SkinOffsets.m_AttributeList + SkinOffsets.m_Attributes;
+                mem.Write<long>(addr,     0);   // size  = 0
+                mem.Write<long>(addr + 8, 0);   // ptr   = null
             }
-
-            // 2. Free the remote memory block
-            if (blockAddr > 0x10000)
-                try { mem.FreeRemote(blockAddr); } catch { }
+            catch { }
         }
-        _allocatedBlocks.Clear();
+        _writtenItemAddrs.Clear();
     }
+
+    // Also called on death so we don't leave stale pointers
+    private void CleanupAllocations(Memory mem) => ZeroGameAttrPointers(mem);
 
     // ═══════════════════════════════════════════════════
     //  ATTRIBUTE LIST
@@ -249,30 +257,30 @@ public class SkinChanger
 
     private void CreateAttributes(Memory mem, long item, int paintKit)
     {
+        if (_attrBuffer == 0) return;                       // buffer not ready
+        if (_attrSlot >= MAX_WEAPONS) return;               // ran out of slots
+
         long attrListAddr = item + SkinOffsets.m_AttributeList + SkinOffsets.m_Attributes;
-        long existingSize = mem.Read<long>(attrListAddr);
-        long existingPtr  = mem.Read<long>(attrListAddr + 8);
 
-        // Already has attributes (not yet cleaned up from this cycle)
-        if (existingSize != 0 || existingPtr != 0) return;
+        // Don't double-write the same item in one tick
+        long existingPtr = mem.Read<long>(attrListAddr + 8);
+        if (existingPtr != 0) return;
 
-        int numAttrs = 3;
-        long memBlock = mem.AllocateRemote((uint)(numAttrs * ATTR_SIZE));
-        if (memBlock == 0) return;
+        // Grab next available slot in our persistent buffer
+        long slotBase = _attrBuffer + (long)_attrSlot * ATTRS_PER_WPN * ATTR_SIZE;
+        _attrSlot++;
 
-        // Track with item address so cleanup can zero game memory
-        _allocatedBlocks.Add((item, memBlock));
+        // Write the three attribute entries (paint=6, seed=7, wear=8)
+        WriteAttr(mem, slotBase + 0 * ATTR_SIZE, 6, (float)paintKit);
+        WriteAttr(mem, slotBase + 1 * ATTR_SIZE, 7, 0f);
+        WriteAttr(mem, slotBase + 2 * ATTR_SIZE, 8, 0.01f);
 
-        // Paint kit (defIndex 6)
-        WriteAttr(mem, memBlock + 0 * ATTR_SIZE, 6, (float)paintKit);
-        // Seed/pattern (defIndex 7)
-        WriteAttr(mem, memBlock + 1 * ATTR_SIZE, 7, 0f);
-        // Wear (defIndex 8)
-        WriteAttr(mem, memBlock + 2 * ATTR_SIZE, 8, 0.01f);
+        // Point the game's attribute list at our buffer slot
+        mem.Write<long>(attrListAddr,     ATTRS_PER_WPN);   // count
+        mem.Write<long>(attrListAddr + 8, slotBase);        // ptr
 
-        // Write size + ptr
-        mem.Write<long>(attrListAddr, numAttrs);
-        mem.Write<long>(attrListAddr + 8, memBlock);
+        // Remember this item address so we can zero the ptr after the call
+        _writtenItemAddrs.Add(item);
     }
 
     private static void WriteAttr(Memory mem, long addr, ushort defIndex, float value)
