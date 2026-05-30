@@ -9,11 +9,13 @@ using static FoxSense.Features.SkinDatabase;
 namespace FoxSense.Features;
 
 /// <summary>
-/// CS2 external skin changer — full port of wompwomp6/cs2-skin-changer.
-/// 1. Patches RegenerateWeaponSkins at startup (code patch)
-/// 2. Creates attribute list entries before calling
-/// 3. Calls RegenerateWeaponSkins via CreateRemoteThread
-/// 4. Removes attribute list entries immediately after (prevents crash)
+/// CS2 external skin changer.
+/// Key fixes vs previous build:
+///  - Weapon ptr/count read order corrected (was swapped)
+///  - CleanupAllocations now zeros game-memory pointers before freeing (stops-working fix)
+///  - Mesh mask reduced from 700-write loop to 3 writes (crash fix)
+///  - Thread.Sleep removed from hot path
+///  - sig-scan retries if it failed first time
 /// </summary>
 public class SkinChanger
 {
@@ -29,9 +31,13 @@ public class SkinChanger
 
     // Scene node offsets for HUD weapon lookup
     private const int m_hHudModelArms = 0x1B58;
-    private const int m_pChild = 0x40;
-    private const int m_pNextSibling = 0x48;
-    private const int m_pOwner = 0x30;
+    private const int m_pChild        = 0x40;
+    private const int m_pNextSibling  = 0x48;
+    private const int m_pOwner        = 0x30;
+
+    // Dirty-model-data offsets for mesh mask
+    private const int m_pDirtyModelData    = 0xD8;
+    private const int m_DirtyMeshGroupMask = 0x10;
 
     // Sig-scanned function
     private long _regenerateSkinsFn;
@@ -40,8 +46,8 @@ public class SkinChanger
     // Attribute struct size (CEconItemAttribute = 0x48 bytes)
     private const int ATTR_SIZE = 0x48;
 
-    // Track remote memory allocations for safe cleanup
-    private readonly List<long> _allocatedBlocks = new();
+    // Track (item-address-in-game, remote-block-address) pairs for proper cleanup
+    private readonly List<(long ItemAddr, long BlockAddr)> _allocatedBlocks = new();
 
     public void SetWeaponSkin(ushort weaponDefIndex, SkinInfo skin)
     {
@@ -56,33 +62,34 @@ public class SkinChanger
     }
 
     public SkinInfo? GetConfiguredSkin(ushort weaponDefIndex)
-    {
-        return _weaponSkins.TryGetValue(weaponDefIndex, out var skin) ? skin : null;
-    }
+        => _weaponSkins.TryGetValue(weaponDefIndex, out var s) ? s : null;
 
     // ═══════════════════════════════════════════════════
-    //  INITIALIZATION (once)
+    //  INITIALIZATION  (sig scan + code patch, once)
     // ═══════════════════════════════════════════════════
 
     private void Initialize(Memory mem)
     {
-        _initialized = true;
-
-        // 1. Sig scan RegenerateWeaponSkins
+        // Don't mark initialized until we actually have the function address
         int clientSize = mem.GetModuleSize("client.dll");
         _regenerateSkinsFn = mem.SigScan(mem.ClientBase, clientSize,
             "48 83 EC ?? E8 ?? ?? ?? ?? 48 85 C0 0F 84 ?? ?? ?? ?? 48 8B 10");
+
         LogDebug($"[SKIN] RegenerateWeaponSkins = 0x{_regenerateSkinsFn:X}");
 
-        if (_regenerateSkinsFn == 0) return;
+        if (_regenerateSkinsFn == 0)
+        {
+            LogDebug("[SKIN] Sig scan failed — will retry next tick");
+            return; // _initialized stays false, retry next tick
+        }
 
-        // 2. Patch the function to read from our attribute list offset
-        // Reference: mem.Write<uint16_t>(Sigs::RegenerateWeaponSkins + 0x52,
-        //     m_AttributeManager + m_Item + m_AttributeList + m_Attributes);
+        // Patch: tell RegenerateWeaponSkins where our attribute list is
         ushort patchValue = (ushort)(SkinOffsets.m_AttributeManager + SkinOffsets.m_Item
                                      + SkinOffsets.m_AttributeList + SkinOffsets.m_Attributes);
         mem.Write<ushort>(_regenerateSkinsFn + 0x52, patchValue);
-        LogDebug($"[SKIN] Patched RegenerateWeaponSkins+0x52 = 0x{patchValue:X}");
+        LogDebug($"[SKIN] Patched +0x52 = 0x{patchValue:X}");
+
+        _initialized = true; // only set after success
     }
 
     // ═══════════════════════════════════════════════════
@@ -99,13 +106,14 @@ public class SkinChanger
             if (!_initialized)
                 Initialize(mem);
 
+            if (_regenerateSkinsFn == 0) return;
+
             long localPawn = state.LocalPawn;
             if (localPawn == 0) return;
 
             int health = mem.Read<int>(localPawn + Offsets.m_iHealth);
             if (health <= 0)
             {
-                // Player is dead — clean up any pending allocations
                 CleanupAllocations(mem);
                 return;
             }
@@ -122,23 +130,21 @@ public class SkinChanger
 
                 long item = weapon + SkinOffsets.m_AttributeManager + SkinOffsets.m_Item;
 
-                // ForceUpdate: reset m_iItemIDHigh to 0 to trigger re-apply
+                // ForceUpdate: reset IDHigh to 0 so we re-apply
                 if (ForceUpdate)
                     mem.Write<uint>(item + SkinOffsets.m_iItemIDHigh, 0);
 
-                // Already applied? Skip.
+                // Already applied — skip
                 if (mem.Read<uint>(item + SkinOffsets.m_iItemIDHigh) == 0xFFFFFFFF)
                     continue;
 
-                // Mark as applied
+                // Mark as applied immediately
                 mem.Write<uint>(item + SkinOffsets.m_iItemIDHigh, 0xFFFFFFFF);
 
                 ushort defIndex = mem.Read<ushort>(item + SkinOffsets.m_iItemDefinitionIndex);
                 if (defIndex == 0) continue;
 
-                // Look up skin for this weapon
                 SkinInfo? skin = null;
-
                 if (DefaultKnives.Contains(defIndex))
                 {
                     if (SelectedKnifeSkin != null && SelectedKnifeSkin.PaintKit != 0)
@@ -153,26 +159,26 @@ public class SkinChanger
 
                 if (skin == null || skin.PaintKit == 0) continue;
 
-                // Write fallback paint kit
+                // Write fallback values
                 mem.Write<int>(weapon + SkinOffsets.m_nFallbackPaintKit, skin.PaintKit);
+                mem.Write<float>(weapon + SkinOffsets.m_flFallbackWear, 0.01f);
+                mem.Write<int>(weapon + SkinOffsets.m_nFallbackSeed, 0);
 
-                // Mesh mask (legacy model = 2, normal = 1)
-                ulong mask = (ulong)(skin.LegacyModel ? 2 : 1);
+                // Mesh mask (legacy = 2, normal = 1)
+                ulong mask = skin.LegacyModel ? 2UL : 1UL;
                 SetMeshMask(mem, weapon, mask);
 
-                // Also set HUD weapon mesh mask
                 long hudWeapon = GetHudWeapon(mem, localPawn, weapon);
                 if (hudWeapon != 0)
                     SetMeshMask(mem, hudWeapon, mask);
 
-                // Create attribute list entries
+                // Write attribute list entries
                 CreateAttributes(mem, item, skin.PaintKit);
 
-                LogDebug($"[SKIN] Applied PK={skin.PaintKit} def={defIndex} mask={mask}");
+                LogDebug($"[SKIN] def={defIndex} PK={skin.PaintKit} mask={mask}");
                 shouldUpdate = true;
             }
 
-            // Call RegenerateWeaponSkins + cleanup
             if (shouldUpdate || ForceUpdate)
                 UpdateWeapons(mem, weapons);
 
@@ -180,29 +186,25 @@ public class SkinChanger
         }
         catch (Exception ex)
         {
-            LogDebug($"[SKIN] Error: {ex.Message}");
+            LogDebug($"[SKIN] Tick error: {ex.Message}");
             CleanupAllocations(mem);
         }
     }
 
     // ═══════════════════════════════════════════════════
-    //  UPDATE WEAPONS (matching reference UpdateWeapons)
+    //  UPDATE WEAPONS
     // ═══════════════════════════════════════════════════
 
     private void UpdateWeapons(Memory mem, List<long> weapons)
     {
-        // Call RegenerateWeaponSkins
-        if (_regenerateSkinsFn != 0)
-        {
-            mem.CallThread(_regenerateSkinsFn);
-            LogDebug("[SKIN] Called RegenerateWeaponSkins");
-        }
+        // Call RegenerateWeaponSkins in the game process
+        mem.CallThread(_regenerateSkinsFn);
+        LogDebug("[SKIN] Called RegenerateWeaponSkins");
 
-        // IMMEDIATELY clean up all remote allocations
-        // This MUST happen right after the call, before death can destroy entities
+        // Cleanup MUST happen right after — zero game pointers then free blocks
         CleanupAllocations(mem);
 
-        // Reset fallback paint kit
+        // Reset fallback paint kit sentinel (so it doesn't stay permanently)
         foreach (long weapon in weapons)
         {
             if (weapon == 0 || weapon < 0x10000) continue;
@@ -210,89 +212,82 @@ public class SkinChanger
         }
     }
 
-    /// <summary>
-    /// Safely frees all tracked remote memory allocations and zeros attribute pointers.
-    /// </summary>
+    // ═══════════════════════════════════════════════════
+    //  CLEANUP
+    //  BUG FIX: must zero game-memory pointers BEFORE freeing the remote block,
+    //  otherwise CreateAttributes sees stale non-zero ptr and permanently skips.
+    // ═══════════════════════════════════════════════════
+
     private void CleanupAllocations(Memory mem)
     {
-        foreach (long block in _allocatedBlocks)
+        foreach (var (itemAddr, blockAddr) in _allocatedBlocks)
         {
-            if (block > 0x10000)
+            // 1. Zero the game-side attribute list vector so CreateAttributes
+            //    doesn't think attributes already exist next application
+            if (itemAddr > 0x10000)
             {
-                try { mem.FreeRemote(block); } catch { }
+                try
+                {
+                    long attrListAddr = itemAddr + SkinOffsets.m_AttributeList + SkinOffsets.m_Attributes;
+                    mem.Write<long>(attrListAddr, 0);       // size = 0
+                    mem.Write<long>(attrListAddr + 8, 0);   // ptr = null
+                }
+                catch { }
             }
+
+            // 2. Free the remote memory block
+            if (blockAddr > 0x10000)
+                try { mem.FreeRemote(blockAddr); } catch { }
         }
         _allocatedBlocks.Clear();
     }
 
     // ═══════════════════════════════════════════════════
-    //  ATTRIBUTE LIST (matching reference econItemAttributeManager)
+    //  ATTRIBUTE LIST
     // ═══════════════════════════════════════════════════
 
     private void CreateAttributes(Memory mem, long item, int paintKit)
     {
-        // Read existing
         long attrListAddr = item + SkinOffsets.m_AttributeList + SkinOffsets.m_Attributes;
         long existingSize = mem.Read<long>(attrListAddr);
-        long existingPtr = mem.Read<long>(attrListAddr + 8);
+        long existingPtr  = mem.Read<long>(attrListAddr + 8);
 
-        // Don't overwrite existing attributes
+        // Already has attributes (not yet cleaned up from this cycle)
         if (existingSize != 0 || existingPtr != 0) return;
 
-        // Allocate remote memory for 3 attributes
         int numAttrs = 3;
         long memBlock = mem.AllocateRemote((uint)(numAttrs * ATTR_SIZE));
         if (memBlock == 0) return;
 
-        // Track for cleanup
-        _allocatedBlocks.Add(memBlock);
+        // Track with item address so cleanup can zero game memory
+        _allocatedBlocks.Add((item, memBlock));
 
-        // Paint (defIndex=6)
+        // Paint kit (defIndex 6)
         WriteAttr(mem, memBlock + 0 * ATTR_SIZE, 6, (float)paintKit);
-        // Pattern (defIndex=7)
+        // Seed/pattern (defIndex 7)
         WriteAttr(mem, memBlock + 1 * ATTR_SIZE, 7, 0f);
-        // Wear (defIndex=8)
+        // Wear (defIndex 8)
         WriteAttr(mem, memBlock + 2 * ATTR_SIZE, 8, 0.01f);
 
-        // Write CPtrGameVector {size, ptr}
+        // Write size + ptr
         mem.Write<long>(attrListAddr, numAttrs);
         mem.Write<long>(attrListAddr + 8, memBlock);
-    }
-
-    private void RemoveAttributes(Memory mem, long item)
-    {
-        long attrListAddr = item + SkinOffsets.m_AttributeList + SkinOffsets.m_Attributes;
-        long size = mem.Read<long>(attrListAddr);
-        long ptr = mem.Read<long>(attrListAddr + 8);
-
-        if (size == 0) return;
-
-        // Clear the vector
-        mem.Write<long>(attrListAddr, 0);
-        mem.Write<long>(attrListAddr + 8, 0);
-
-        // Free remote memory
-        if (ptr > 0x10000)
-            mem.FreeRemote(ptr);
     }
 
     private static void WriteAttr(Memory mem, long addr, ushort defIndex, float value)
     {
         byte[] zeros = new byte[ATTR_SIZE];
         mem.WriteBytes(addr, zeros);
-        mem.Write<ushort>(addr + 0x30, defIndex);  // defIndex
-        mem.Write<float>(addr + 0x34, value);       // value
-        mem.Write<float>(addr + 0x38, value);       // initValue
+        mem.Write<ushort>(addr + 0x30, defIndex);
+        mem.Write<float>(addr + 0x34, value);
+        mem.Write<float>(addr + 0x38, value);
     }
 
     // ═══════════════════════════════════════════════════
-    //  MESH MASK (matching reference SetMeshMask — aggressive write)
-    //  Reference uses 700-write loop because network sync overrides single writes
+    //  MESH MASK
+    //  FIX: removed 700-write loop (caused crashes).
+    //  3 writes is enough to win the race with the network system.
     // ═══════════════════════════════════════════════════
-
-    // Dirty model data offsets (hardcoded in reference)
-    private const int m_pDirtyModelData = 0xD8;
-    private const int m_DirtyMeshGroupMask = 0x10;
 
     private static void SetMeshMask(Memory mem, long entity, ulong mask)
     {
@@ -301,33 +296,23 @@ public class SkinChanger
 
         long modelState = sceneNode + SkinOffsets.m_modelState_skin;
 
-        // Write dirty model data mask (tells game the mesh needs updating)
-        long dirtyAttributes = mem.Read<long>(modelState + m_pDirtyModelData);
-        if (dirtyAttributes != 0 && dirtyAttributes > 0x10000)
-            mem.Write<ulong>(dirtyAttributes + m_DirtyMeshGroupMask, mask);
+        // Dirty data mask
+        long dirtyAttr = mem.Read<long>(modelState + m_pDirtyModelData);
+        if (dirtyAttr > 0x10000)
+            mem.Write<ulong>(dirtyAttr + m_DirtyMeshGroupMask, mask);
 
-        // Aggressive write loop — network sync keeps resetting, so we spam
-        for (int i = 0; i < 700; i++)
-            mem.Write<ulong>(modelState + SkinOffsets.m_MeshGroupMask, mask);
-
-        // Verify
-        Thread.Sleep(5);
-        ulong current = mem.Read<ulong>(modelState + SkinOffsets.m_MeshGroupMask);
-        if (current != mask)
-        {
-            // Retry once
-            for (int i = 0; i < 700; i++)
-                mem.Write<ulong>(modelState + SkinOffsets.m_MeshGroupMask, mask);
-        }
+        // Write the mesh group mask — 3 writes wins the race without causing crashes
+        mem.Write<ulong>(modelState + SkinOffsets.m_MeshGroupMask, mask);
+        mem.Write<ulong>(modelState + SkinOffsets.m_MeshGroupMask, mask);
+        mem.Write<ulong>(modelState + SkinOffsets.m_MeshGroupMask, mask);
     }
 
     // ═══════════════════════════════════════════════════
-    //  HUD WEAPON LOOKUP (matching reference GetHudWeapon)
+    //  HUD WEAPON LOOKUP
     // ═══════════════════════════════════════════════════
 
     private static long GetHudWeapon(Memory mem, long localPawn, long weapon)
     {
-        // Get HUD model arms entity
         int armsHandle = mem.Read<int>(localPawn + m_hHudModelArms);
         if (armsHandle == 0 || armsHandle == -1) return 0;
 
@@ -337,16 +322,15 @@ public class SkinChanger
         long armsBase = EntityResolver.ResolvePawn(mem, entityList, armsHandle);
         if (armsBase == 0) return 0;
 
-        // Traverse scene node children to find the HUD weapon
         long armsNode = mem.Read<long>(armsBase + SkinOffsets.m_pGameSceneNode_skin);
         if (armsNode == 0 || armsNode < 0x10000) return 0;
 
         long viewModel = mem.Read<long>(armsNode + m_pChild);
         int iterations = 0;
-        while (viewModel != 0 && viewModel > 0x10000 && iterations++ < 32)
+        while (viewModel > 0x10000 && iterations++ < 32)
         {
             long owner = mem.Read<long>(viewModel + m_pOwner);
-            if (owner != 0 && owner > 0x10000)
+            if (owner > 0x10000)
             {
                 int ownerHandle = mem.Read<int>(owner + SkinOffsets.m_hOwnerEntity);
                 long ownerEntity = EntityResolver.ResolvePawn(mem, entityList, ownerHandle);
@@ -360,14 +344,17 @@ public class SkinChanger
 
     // ═══════════════════════════════════════════════════
     //  WEAPON ENUMERATION
+    //  FIX: CNetworkUtlVectorBase layout is ptr@+0, count@+8 (int, not long).
+    //  Previous code had them swapped, so weapons were never found.
     // ═══════════════════════════════════════════════════
 
     private static List<long> GetWeaponEntities(Memory mem, long weaponServices)
     {
         var result = new List<long>(16);
-        long arrayBase = weaponServices + SkinOffsets.m_hMyWeapons;
-        long weaponCount = mem.Read<long>(arrayBase);
-        long weaponEntry = mem.Read<long>(arrayBase + 8);
+
+        long arrayBase   = weaponServices + SkinOffsets.m_hMyWeapons;
+        long weaponEntry = mem.Read<long>(arrayBase);       // ptr to handle array  (was wrongly read as count)
+        int  weaponCount = mem.Read<int>(arrayBase + 8);    // element count as int (was wrongly read as ptr)
 
         if (weaponCount <= 0 || weaponCount > 64 || weaponEntry < 0x10000)
             return result;
@@ -375,12 +362,12 @@ public class SkinChanger
         long entityList = mem.Read<long>(mem.ClientAddr(Offsets.dwEntityList));
         if (entityList == 0) return result;
 
-        for (long i = 0; i < weaponCount; i++)
+        for (int i = 0; i < weaponCount; i++)
         {
             int handle = mem.Read<int>(weaponEntry + i * 4);
             if (handle == 0 || handle == -1) continue;
             long entity = EntityResolver.ResolvePawn(mem, entityList, handle);
-            if (entity != 0 && entity > 0x10000)
+            if (entity > 0x10000)
                 result.Add(entity);
         }
         return result;
@@ -394,63 +381,18 @@ public class SkinChanger
     {
         if (SelectedGlove == null || SelectedGlove.DefIndex == 0) return;
 
-        // m_EconGloves is a C_EconItemView embedded in the pawn
         long gloveItem = localPawn + SkinOffsets.m_EconGloves;
 
-        // Only write once (check if already set)
         ushort currentDef = mem.Read<ushort>(gloveItem + SkinOffsets.m_iItemDefinitionIndex);
         if (currentDef == SelectedGlove.DefIndex) return;
 
-        // Write glove definition
         mem.Write<ushort>(gloveItem + SkinOffsets.m_iItemDefinitionIndex, SelectedGlove.DefIndex);
-        mem.Write<int>(gloveItem + SkinOffsets.m_iEntityQuality, 4); // 4 = glove quality
+        mem.Write<int>(gloveItem + SkinOffsets.m_iEntityQuality, 4);
         mem.Write<uint>(gloveItem + SkinOffsets.m_iItemIDHigh, 0xFFFFFFFF);
         mem.Write<bool>(gloveItem + SkinOffsets.m_bInitialized, true);
-
-        // Force glove re-apply
         mem.Write<bool>(localPawn + SkinOffsets.m_bNeedToReApplyGloves, true);
 
-        LogDebug($"[SKIN] Glove set def={SelectedGlove.DefIndex}");
-    }
-
-    // ═══════════════════════════════════════════════════
-    //  MURMURHASH2 (for m_nSubclassID)
-    //  Reference uses STRINGTOKEN_MURMURHASH_SEED = 0x31415926
-    // ═══════════════════════════════════════════════════
-
-    private const uint MURMURHASH_SEED = 0x31415926;
-
-    private static uint MurmurHash2(byte[] data)
-    {
-        const uint m = 0x5BD1E995;
-        const int r = 24;
-        uint len = (uint)data.Length;
-        uint h = MURMURHASH_SEED ^ len;
-        int i = 0;
-
-        while (len >= 4)
-        {
-            uint k = BitConverter.ToUInt32(data, i);
-            k *= m;
-            k ^= k >> r;
-            k *= m;
-            h *= m;
-            h ^= k;
-            i += 4;
-            len -= 4;
-        }
-
-        switch (len)
-        {
-            case 3: h ^= (uint)data[i + 2] << 16; goto case 2;
-            case 2: h ^= (uint)data[i + 1] << 8; goto case 1;
-            case 1: h ^= data[i]; h *= m; break;
-        }
-
-        h ^= h >> 13;
-        h *= m;
-        h ^= h >> 15;
-        return h;
+        LogDebug($"[SKIN] Glove def={SelectedGlove.DefIndex}");
     }
 
     // ═══════════════════════════════════════════════════
