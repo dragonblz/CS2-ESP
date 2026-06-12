@@ -5,8 +5,9 @@ using System.Text.Json;
 namespace FoxSense.Core;
 
 /// <summary>
-/// Auto-fetches the latest offsets from sezzyaep/CS2-OFFSETS on startup.
+/// Auto-fetches the latest offsets from a2x/cs2-dumper on startup.
 /// Falls back to cache if fetch fails.
+/// Source: https://github.com/a2x/cs2-dumper
 /// </summary>
 public static class OffsetUpdater
 {
@@ -15,8 +16,8 @@ public static class OffsetUpdater
     private static readonly string _cacheDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "FoxSense");
 
-    private const string OFFSETS_URL = "https://raw.githubusercontent.com/sezzyaep/CS2-OFFSETS/main/offsets.json";
-    private const string CLIENT_URL  = "https://raw.githubusercontent.com/sezzyaep/CS2-OFFSETS/main/client_dll.json";
+    private const string OFFSETS_URL = "https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/offsets.json";
+    private const string CLIENT_URL  = "https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/client_dll.json";
 
     public static async Task<bool> UpdateAsync()
     {
@@ -95,7 +96,8 @@ public static class OffsetUpdater
 
     // ═══════════════════════════════════════════════════
     //  CLIENT OFFSETS (client_dll.json)
-    //  sezzyaep format: "fieldName": {"offset": N, "type": "..."}
+    //  a2x format: "fieldName": N  (flat integer)
+    //  SetField handles both flat-int and sezzyaep {"offset": N} formats.
     // ═══════════════════════════════════════════════════
 
     private static void ApplyClientOffsets(string json)
